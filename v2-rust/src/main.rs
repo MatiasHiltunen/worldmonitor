@@ -42,6 +42,9 @@ use v3_rust_server::{
 
 const DEFAULT_CHATJIMMY_PACK_PATH: &str =
     "/data/data/com.termux/files/home/lega/tui_webflow/packs/chatjimmy_news_single.eon";
+const MAP_MIN_ZOOM: f64 = 0.55;
+const MAP_MAX_ZOOM: f64 = 8.0;
+const MAP_ZOOM_STEP: f64 = 0.08;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -2017,12 +2020,14 @@ impl App {
     }
 
     fn map_zoom_in(&mut self) {
-        self.map_camera.zoom = (self.map_camera.zoom + 0.12).clamp(0.7, 3.8);
+        self.map_camera.zoom =
+            (self.map_camera.zoom + MAP_ZOOM_STEP).clamp(MAP_MIN_ZOOM, MAP_MAX_ZOOM);
         self.map_region_view = MapRegionView::Custom;
     }
 
     fn map_zoom_out(&mut self) {
-        self.map_camera.zoom = (self.map_camera.zoom - 0.12).clamp(0.7, 3.8);
+        self.map_camera.zoom =
+            (self.map_camera.zoom - MAP_ZOOM_STEP).clamp(MAP_MIN_ZOOM, MAP_MAX_ZOOM);
         self.map_region_view = MapRegionView::Custom;
     }
 

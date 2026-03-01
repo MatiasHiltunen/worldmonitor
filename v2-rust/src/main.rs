@@ -16,13 +16,19 @@ use crossterm::{
 };
 use feed_rs::parser;
 use flow::VersionPackLoader;
+use geo::{LineString, Simplify};
+use geojson::GeoJson;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Wrap,
+        canvas::{Canvas, Circle, Context as CanvasContext, Line as CanvasLine, Points},
+    },
 };
 use ratatui_textarea::{Input as TextInput, TextArea};
 use reqwest::blocking::Client;
@@ -140,6 +146,7 @@ enum AppView {
     Rss,
     Brief,
     Settings,
+    Map,
 }
 
 impl AppView {
@@ -148,7 +155,8 @@ impl AppView {
             AppView::Api => AppView::Rss,
             AppView::Rss => AppView::Brief,
             AppView::Brief => AppView::Settings,
-            AppView::Settings => AppView::Api,
+            AppView::Settings => AppView::Map,
+            AppView::Map => AppView::Api,
         }
     }
 }
@@ -303,12 +311,23 @@ const BRIEF_COUNTRIES: &[(&str, &str)] = &[
     ("VE", "Venezuela"),
 ];
 
+const TIER1_COUNTRY_CODES: &[&str] = &[
+    "US", "RU", "CN", "UA", "IR", "IL", "TW", "KP", "SA", "TR", "PL", "DE", "FR", "GB", "IN", "PK",
+    "SY", "YE", "MM", "VE", "BR", "AE",
+];
+
 fn feed_sources_for_variant(variant: FeedVariant) -> &'static [FeedSource] {
     match variant {
         FeedVariant::World => WORLD_FEEDS,
         FeedVariant::Tech => TECH_FEEDS,
         FeedVariant::Finance => FINANCE_FEEDS,
     }
+}
+
+fn is_tier1_country_code(code: &str) -> bool {
+    TIER1_COUNTRY_CODES
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(code))
 }
 
 fn country_name_from_code(code: &str) -> String {
@@ -452,6 +471,112 @@ struct SettingsCheck {
 struct BriefSourceEvidence {
     id: String,
     text: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MapCountryBoundary {
+    code: String,
+    name: String,
+    rings: Vec<Vec<(f64, f64)>>, // lon, lat
+    centroid_lon: f64,
+    centroid_lat: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MapEventKind {
+    Earthquake,
+    Unrest,
+}
+
+#[derive(Clone, Debug)]
+struct MapEventMarker {
+    id: String,
+    kind: MapEventKind,
+    title: String,
+    subtitle: String,
+    lat: f64,
+    lon: f64,
+    severity: String,
+    magnitude: f64,
+    occurred_at: i64,
+}
+
+impl Default for MapEventMarker {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: MapEventKind::Earthquake,
+            title: String::new(),
+            subtitle: String::new(),
+            lat: 0.0,
+            lon: 0.0,
+            severity: String::new(),
+            magnitude: 0.0,
+            occurred_at: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MapLayerState {
+    countries: bool,
+    graticule: bool,
+    earthquakes: bool,
+    unrest: bool,
+    tier1: bool,
+}
+
+impl Default for MapLayerState {
+    fn default() -> Self {
+        Self {
+            countries: true,
+            graticule: true,
+            earthquakes: true,
+            unrest: true,
+            tier1: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlobeCamera {
+    yaw_deg: f64,
+    pitch_deg: f64,
+    zoom: f64,
+    auto_rotate: bool,
+}
+
+impl Default for GlobeCamera {
+    fn default() -> Self {
+        Self {
+            yaw_deg: 0.0,
+            pitch_deg: -12.0,
+            zoom: 1.35,
+            auto_rotate: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MapFetchResult {
+    earthquakes: Vec<MapEventMarker>,
+    unrest: Vec<MapEventMarker>,
+    duration_ms: u128,
+    fetched_sources: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GlobePoint3 {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GlobePoint2 {
+    x: f64,
+    y: f64,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1140,6 +1265,15 @@ struct App {
     brief_brief_scroll: u16,
     brief_news_scroll: u16,
     brief_provider_label: String,
+    map_in_flight: bool,
+    map_last_fetch_finished_at: Option<Instant>,
+    map_last_fetch_summary: String,
+    map_camera: GlobeCamera,
+    map_layers: MapLayerState,
+    map_countries: Vec<MapCountryBoundary>,
+    map_selected_event: usize,
+    map_events: Vec<MapEventMarker>,
+    map_status_note: String,
     transport_label: String,
     base_url_display: String,
     settings_checks: Vec<SettingsCheck>,
@@ -1169,6 +1303,7 @@ impl App {
             build_single_line_editor("Country code (ISO-2, Enter apply, Esc cancel)");
         brief_country_editor.insert_str(brief_country_code.clone());
         let settings_checks = build_settings_checks(api);
+        let (map_countries, map_status_note) = load_globe_boundaries();
 
         let request_editor = build_request_editor(
             request_bodies
@@ -1189,7 +1324,7 @@ impl App {
                 template_source,
                 String::new(),
                 "Use Up/Down to choose endpoint, Enter/r to fetch.".to_string(),
-                "Press Tab to switch API/RSS/BRIEF/SETTINGS workspaces.".to_string(),
+                "Press Tab to switch API/RSS/BRIEF/SETTINGS/MAP workspaces.".to_string(),
                 "Press e to edit request JSON, a to toggle auto-refresh.".to_string(),
                 "Press t to reset current request body to template.".to_string(),
                 "Use j/k to scroll response, q or Esc to quit.".to_string(),
@@ -1245,6 +1380,15 @@ impl App {
             brief_brief_scroll: 0,
             brief_news_scroll: 0,
             brief_provider_label: api.brief_provider_label().to_string(),
+            map_in_flight: false,
+            map_last_fetch_finished_at: None,
+            map_last_fetch_summary: "Map data not fetched yet".to_string(),
+            map_camera: GlobeCamera::default(),
+            map_layers: MapLayerState::default(),
+            map_countries,
+            map_selected_event: 0,
+            map_events: Vec::new(),
+            map_status_note,
             transport_label: api.transport_label().to_string(),
             base_url_display: api.base_url.clone(),
             settings_checks,
@@ -1376,6 +1520,9 @@ impl App {
             AppView::Settings => {
                 self.status_line =
                     "Switched to SETTINGS workspace (API key/provider audit)".to_string();
+            }
+            AppView::Map => {
+                self.status_line = "Switched to MAP workspace".to_string();
             }
         }
     }
@@ -1725,6 +1872,121 @@ impl App {
         self.settings_detail_scroll = self.settings_detail_scroll.saturating_sub(1);
     }
 
+    fn map_rotate_yaw(&mut self, delta_deg: f64) {
+        self.map_camera.yaw_deg = normalize_longitude_deg(self.map_camera.yaw_deg + delta_deg);
+    }
+
+    fn map_rotate_pitch(&mut self, delta_deg: f64) {
+        self.map_camera.pitch_deg = (self.map_camera.pitch_deg + delta_deg).clamp(-80.0, 80.0);
+    }
+
+    fn map_zoom_in(&mut self) {
+        self.map_camera.zoom = (self.map_camera.zoom + 0.12).clamp(0.7, 3.8);
+    }
+
+    fn map_zoom_out(&mut self) {
+        self.map_camera.zoom = (self.map_camera.zoom - 0.12).clamp(0.7, 3.8);
+    }
+
+    fn map_reset_camera(&mut self) {
+        self.map_camera = GlobeCamera::default();
+        self.status_line = "Map camera reset".to_string();
+    }
+
+    fn map_toggle_auto_rotate(&mut self) {
+        self.map_camera.auto_rotate = !self.map_camera.auto_rotate;
+        self.status_line = if self.map_camera.auto_rotate {
+            "Map auto-rotate enabled".to_string()
+        } else {
+            "Map auto-rotate disabled".to_string()
+        };
+    }
+
+    fn map_toggle_layer_countries(&mut self) {
+        self.map_layers.countries = !self.map_layers.countries;
+    }
+
+    fn map_toggle_layer_graticule(&mut self) {
+        self.map_layers.graticule = !self.map_layers.graticule;
+    }
+
+    fn map_toggle_layer_earthquakes(&mut self) {
+        self.map_layers.earthquakes = !self.map_layers.earthquakes;
+    }
+
+    fn map_toggle_layer_unrest(&mut self) {
+        self.map_layers.unrest = !self.map_layers.unrest;
+    }
+
+    fn map_toggle_layer_tier1(&mut self) {
+        self.map_layers.tier1 = !self.map_layers.tier1;
+    }
+
+    fn map_select_next_event(&mut self) {
+        if self.map_events.is_empty() {
+            self.map_selected_event = 0;
+            return;
+        }
+        self.map_selected_event = (self.map_selected_event + 1) % self.map_events.len();
+    }
+
+    fn map_select_prev_event(&mut self) {
+        if self.map_events.is_empty() {
+            self.map_selected_event = 0;
+            return;
+        }
+        if self.map_selected_event == 0 {
+            self.map_selected_event = self.map_events.len() - 1;
+        } else {
+            self.map_selected_event -= 1;
+        }
+    }
+
+    fn map_focus_selected_event(&mut self) {
+        let Some(event) = self.map_events.get(self.map_selected_event) else {
+            return;
+        };
+        self.map_camera.yaw_deg = normalize_longitude_deg(-event.lon);
+        self.map_camera.pitch_deg = (-event.lat).clamp(-80.0, 80.0);
+        self.status_line = format!(
+            "Map focused on {}",
+            truncate_for_error(event.title.as_str(), 70)
+        );
+    }
+
+    fn map_focus_country(&mut self, country_code: &str) -> bool {
+        if let Some(country) = self
+            .map_countries
+            .iter()
+            .find(|country| country.code.eq_ignore_ascii_case(country_code))
+        {
+            self.map_camera.yaw_deg = normalize_longitude_deg(-country.centroid_lon);
+            self.map_camera.pitch_deg = (-country.centroid_lat).clamp(-80.0, 80.0);
+            self.status_line = format!("Map focused on {} ({})", country.name, country.code);
+            return true;
+        }
+        false
+    }
+
+    fn map_tick_auto_rotate(&mut self) {
+        if self.view == AppView::Map && self.map_camera.auto_rotate {
+            self.map_rotate_yaw(0.8);
+        }
+    }
+
+    fn should_auto_refresh_map(&self) -> bool {
+        let Some(interval) = self.refresh_interval else {
+            return false;
+        };
+        if !self.auto_refresh_enabled || self.map_in_flight || self.view != AppView::Map {
+            return false;
+        }
+        match self.map_last_fetch_finished_at {
+            Some(last) => last.elapsed() >= interval,
+            None => true,
+        }
+    }
+
     fn should_auto_refresh_api(&self) -> bool {
         let Some(interval) = self.refresh_interval else {
             return false;
@@ -1792,6 +2054,7 @@ impl App {
             AppView::Rss => self.rss_last_fetch_finished_at,
             AppView::Brief => self.brief_last_fetch_finished_at,
             AppView::Settings => None,
+            AppView::Map => self.map_last_fetch_finished_at,
         };
 
         let remaining = match base {
@@ -1820,6 +2083,8 @@ enum WorkerEvent {
         snapshot: BriefSnapshot,
         duration_ms: u128,
     },
+    MapSuccess(MapFetchResult),
+    MapFailure(String),
 }
 
 fn truncate_for_error(input: &str, max_chars: usize) -> String {
@@ -2159,15 +2424,30 @@ struct EarthquakesResponse {
     earthquakes: Vec<Earthquake>,
 }
 
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct GeoCoordinates {
+    #[serde(default)]
+    latitude: f64,
+    #[serde(default)]
+    longitude: f64,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct Earthquake {
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     place: String,
     #[serde(default)]
     magnitude: f64,
     #[serde(default)]
     depth_km: f64,
+    #[serde(default)]
+    location: Option<GeoCoordinates>,
+    #[serde(default)]
+    occurred_at: i64,
 }
 
 fn format_earthquakes(payload: Value) -> Result<Vec<String>> {
@@ -2201,11 +2481,19 @@ struct UnrestResponse {
 #[serde(rename_all = "camelCase")]
 struct UnrestEvent {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     title: String,
+    #[serde(default)]
+    event_type: String,
     #[serde(default)]
     country: String,
     #[serde(default)]
     severity: String,
+    #[serde(default)]
+    location: Option<GeoCoordinates>,
+    #[serde(default)]
+    occurred_at: i64,
 }
 
 fn format_unrest(payload: Value) -> Result<Vec<String>> {
@@ -2314,6 +2602,516 @@ fn format_crypto_quotes(payload: Value) -> Result<Vec<String>> {
         ));
     }
     Ok(lines)
+}
+
+fn normalize_longitude_deg(value: f64) -> f64 {
+    let mut out = value;
+    while out > 180.0 {
+        out -= 360.0;
+    }
+    while out < -180.0 {
+        out += 360.0;
+    }
+    out
+}
+
+fn countries_geojson_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("public")
+        .join("data")
+        .join("countries.geojson")
+}
+
+fn simplify_country_ring(raw_ring: &[Vec<f64>]) -> Vec<(f64, f64)> {
+    let mut points = raw_ring
+        .iter()
+        .filter_map(|coord| {
+            if coord.len() < 2 {
+                return None;
+            }
+            let lon = coord[0];
+            let lat = coord[1];
+            if lon.is_finite() && lat.is_finite() {
+                Some((lon, lat))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if points.len() < 3 {
+        return Vec::new();
+    }
+
+    let epsilon = if points.len() > 1500 {
+        0.75
+    } else if points.len() > 700 {
+        0.45
+    } else if points.len() > 220 {
+        0.25
+    } else {
+        0.12
+    };
+
+    let linestring: LineString<f64> = points.iter().map(|(x, y)| (*x, *y)).collect();
+    let simplified = linestring.simplify(epsilon);
+    points = simplified
+        .points()
+        .map(|point| (point.x(), point.y()))
+        .collect();
+
+    if points.len() >= 3 {
+        let first = points.first().copied().unwrap_or((0.0, 0.0));
+        let last = points.last().copied().unwrap_or((0.0, 0.0));
+        if (first.0 - last.0).abs() > f64::EPSILON || (first.1 - last.1).abs() > f64::EPSILON {
+            points.push(first);
+        }
+    }
+    points
+}
+
+fn country_code_from_properties(
+    properties: Option<&Map<String, Value>>,
+    fallback: usize,
+) -> String {
+    let read = |key: &str| {
+        properties
+            .and_then(|props| props.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let code = read("ISO3166-1-Alpha-2")
+        .or_else(|| read("ISO_A2"))
+        .or_else(|| read("iso_a2"))
+        .unwrap_or_else(|| format!("C{}", fallback + 1));
+    code.to_uppercase()
+}
+
+fn country_name_from_properties(properties: Option<&Map<String, Value>>, code: &str) -> String {
+    let read = |key: &str| {
+        properties
+            .and_then(|props| props.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    read("name")
+        .or_else(|| read("NAME"))
+        .or_else(|| read("admin"))
+        .unwrap_or_else(|| code.to_string())
+}
+
+fn centroid_from_rings(rings: &[Vec<(f64, f64)>]) -> Option<(f64, f64)> {
+    let mut sum_lon = 0.0f64;
+    let mut sum_lat = 0.0f64;
+    let mut count = 0usize;
+    for ring in rings {
+        for (lon, lat) in ring {
+            sum_lon += *lon;
+            sum_lat += *lat;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        None
+    } else {
+        Some((sum_lon / count as f64, sum_lat / count as f64))
+    }
+}
+
+fn extract_country_rings(geometry: &geojson::Geometry) -> Vec<Vec<(f64, f64)>> {
+    match &geometry.value {
+        geojson::Value::Polygon(polygons) => polygons
+            .iter()
+            .map(|ring| simplify_country_ring(ring))
+            .filter(|ring| ring.len() >= 3)
+            .collect(),
+        geojson::Value::MultiPolygon(multi) => multi
+            .iter()
+            .flat_map(|polygon| polygon.iter().map(|ring| simplify_country_ring(ring)))
+            .filter(|ring| ring.len() >= 3)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn load_globe_boundaries() -> (Vec<MapCountryBoundary>, String) {
+    let path = countries_geojson_path();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                Vec::new(),
+                format!(
+                    "countries.geojson unavailable: {}",
+                    truncate_for_error(&error.to_string(), 120)
+                ),
+            );
+        }
+    };
+    let parsed = match text.parse::<GeoJson>() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                format!(
+                    "countries.geojson parse failed: {}",
+                    truncate_for_error(&error.to_string(), 120)
+                ),
+            );
+        }
+    };
+
+    let GeoJson::FeatureCollection(collection) = parsed else {
+        return (
+            Vec::new(),
+            "countries.geojson did not contain a feature collection".to_string(),
+        );
+    };
+
+    let mut boundaries = Vec::new();
+    let mut segment_count = 0usize;
+    for (index, feature) in collection.features.iter().enumerate() {
+        let Some(geometry) = feature.geometry.as_ref() else {
+            continue;
+        };
+        let rings = extract_country_rings(geometry);
+        if rings.is_empty() {
+            continue;
+        }
+        let code = country_code_from_properties(feature.properties.as_ref(), index);
+        let name = country_name_from_properties(feature.properties.as_ref(), &code);
+        let (centroid_lon, centroid_lat) = centroid_from_rings(&rings).unwrap_or((0.0, 0.0));
+        segment_count += rings
+            .iter()
+            .map(|ring| ring.len().saturating_sub(1))
+            .sum::<usize>();
+        boundaries.push(MapCountryBoundary {
+            code,
+            name,
+            rings,
+            centroid_lon,
+            centroid_lat,
+        });
+    }
+
+    if boundaries.is_empty() {
+        return (
+            boundaries,
+            "Loaded 0 countries from countries.geojson".to_string(),
+        );
+    }
+
+    let note = format!(
+        "Loaded {} countries / {} segments from {}",
+        boundaries.len(),
+        segment_count,
+        path.display()
+    );
+    (boundaries, note)
+}
+
+fn marker_kind_label(kind: MapEventKind) -> &'static str {
+    match kind {
+        MapEventKind::Earthquake => "EQ",
+        MapEventKind::Unrest => "UNREST",
+    }
+}
+
+fn map_marker_color(marker: &MapEventMarker) -> Color {
+    match marker.kind {
+        MapEventKind::Earthquake => {
+            if marker.magnitude >= 7.0 {
+                Color::Red
+            } else if marker.magnitude >= 6.0 {
+                Color::LightRed
+            } else if marker.magnitude >= 5.0 {
+                Color::Yellow
+            } else {
+                Color::LightYellow
+            }
+        }
+        MapEventKind::Unrest => match marker.severity.as_str() {
+            "SEVERITY_LEVEL_HIGH" => Color::Red,
+            "SEVERITY_LEVEL_MEDIUM" => Color::LightRed,
+            "SEVERITY_LEVEL_LOW" => Color::Yellow,
+            _ => Color::LightYellow,
+        },
+    }
+}
+
+fn build_map_markers_from_earthquakes(payload: Value) -> Result<Vec<MapEventMarker>> {
+    let response: EarthquakesResponse =
+        serde_json::from_value(payload).context("failed to decode seismology map response")?;
+    let markers = response
+        .earthquakes
+        .into_iter()
+        .filter_map(|quake| {
+            let location = quake.location?;
+            if !location.latitude.is_finite() || !location.longitude.is_finite() {
+                return None;
+            }
+            Some(MapEventMarker {
+                id: if quake.id.is_empty() {
+                    format!("eq-{}-{}", location.latitude, location.longitude)
+                } else {
+                    quake.id
+                },
+                kind: MapEventKind::Earthquake,
+                title: quake.place,
+                subtitle: format!("M{:.1} | {:.1} km", quake.magnitude, quake.depth_km),
+                lat: location.latitude,
+                lon: normalize_longitude_deg(location.longitude),
+                severity: String::new(),
+                magnitude: quake.magnitude,
+                occurred_at: quake.occurred_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(markers)
+}
+
+fn build_map_markers_from_unrest(
+    payload: Value,
+    country_centroids: &HashMap<String, (f64, f64)>,
+) -> Result<Vec<MapEventMarker>> {
+    let response: UnrestResponse =
+        serde_json::from_value(payload).context("failed to decode unrest map response")?;
+    let markers = response
+        .events
+        .into_iter()
+        .filter_map(|event| {
+            let (lat, lon) = if let Some(location) = event.location {
+                (
+                    location.latitude,
+                    normalize_longitude_deg(location.longitude),
+                )
+            } else {
+                let fallback = country_centroids.get(event.country.to_uppercase().as_str())?;
+                (fallback.1, fallback.0)
+            };
+            if !lat.is_finite() || !lon.is_finite() {
+                return None;
+            }
+            Some(MapEventMarker {
+                id: if event.id.is_empty() {
+                    format!("unrest-{}-{}-{}", event.country, lat, lon)
+                } else {
+                    event.id
+                },
+                kind: MapEventKind::Unrest,
+                title: if event.title.trim().is_empty() {
+                    format!(
+                        "{} {}",
+                        event.country,
+                        compact_enum_label(&event.event_type)
+                    )
+                } else {
+                    event.title
+                },
+                subtitle: if event.country.is_empty() {
+                    compact_enum_label(&event.severity).to_string()
+                } else {
+                    format!(
+                        "{} | {}",
+                        event.country,
+                        compact_enum_label(&event.severity)
+                    )
+                },
+                lat,
+                lon,
+                severity: event.severity,
+                magnitude: 0.0,
+                occurred_at: event.occurred_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(markers)
+}
+
+fn fetch_map_snapshot(
+    api: &ApiClient,
+    country_centroids: HashMap<String, (f64, f64)>,
+) -> MapFetchResult {
+    let started = Instant::now();
+    let mut result = MapFetchResult::default();
+
+    match api.fetch_json(
+        Endpoint::SeismologyEarthquakes,
+        &Endpoint::SeismologyEarthquakes.default_request_body(),
+    ) {
+        Ok(payload) => match build_map_markers_from_earthquakes(payload) {
+            Ok(markers) => {
+                result.earthquakes = markers;
+                result.fetched_sources += 1;
+            }
+            Err(error) => result.warnings.push(format!(
+                "Earthquake map parse failed: {}",
+                format_error_chain(&error, 180)
+            )),
+        },
+        Err(error) => result.warnings.push(format!(
+            "Earthquake map request failed: {}",
+            format_error_chain(&error, 180)
+        )),
+    }
+
+    match api.fetch_json(
+        Endpoint::UnrestEvents,
+        &Endpoint::UnrestEvents.default_request_body(),
+    ) {
+        Ok(payload) => match build_map_markers_from_unrest(payload, &country_centroids) {
+            Ok(markers) => {
+                result.unrest = markers;
+                result.fetched_sources += 1;
+            }
+            Err(error) => result.warnings.push(format!(
+                "Unrest map parse failed: {}",
+                format_error_chain(&error, 180)
+            )),
+        },
+        Err(error) => result.warnings.push(format!(
+            "Unrest map request failed: {}",
+            format_error_chain(&error, 180)
+        )),
+    }
+
+    result.duration_ms = started.elapsed().as_millis();
+    result
+}
+
+fn rotate_globe_point(lon_deg: f64, lat_deg: f64, camera: &GlobeCamera) -> GlobePoint3 {
+    let lon_rad = lon_deg * std::f64::consts::PI / 180.0;
+    let lat_rad = lat_deg * std::f64::consts::PI / 180.0;
+    let yaw_rad = camera.yaw_deg * std::f64::consts::PI / 180.0;
+    let pitch_rad = (camera.pitch_deg * std::f64::consts::PI / 180.0).clamp(-1.4, 1.4);
+
+    let base_x = lat_rad.cos() * lon_rad.cos();
+    let base_y = lat_rad.sin();
+    let base_z = lat_rad.cos() * lon_rad.sin();
+
+    let yaw_x = (base_x * yaw_rad.cos()) - (base_z * yaw_rad.sin());
+    let yaw_z = (base_x * yaw_rad.sin()) + (base_z * yaw_rad.cos());
+
+    let pitch_x = (yaw_x * pitch_rad.cos()) - (base_y * pitch_rad.sin());
+    let pitch_y = (yaw_x * pitch_rad.sin()) + (base_y * pitch_rad.cos());
+
+    GlobePoint3 {
+        x: pitch_x,
+        y: pitch_y,
+        z: yaw_z,
+    }
+}
+
+fn project_globe_point(point: GlobePoint3, camera: &GlobeCamera) -> GlobePoint2 {
+    GlobePoint2 {
+        x: point.z * camera.zoom,
+        y: point.y * camera.zoom,
+    }
+}
+
+fn clip_segment_to_front_hemisphere(
+    a: GlobePoint3,
+    b: GlobePoint3,
+) -> Option<(GlobePoint3, GlobePoint3)> {
+    let a_front = a.x >= 0.0;
+    let b_front = b.x >= 0.0;
+
+    if a_front && b_front {
+        return Some((a, b));
+    }
+    if !a_front && !b_front {
+        return None;
+    }
+
+    let denominator = a.x - b.x;
+    if denominator.abs() < f64::EPSILON {
+        return None;
+    }
+    let t = (a.x / denominator).clamp(0.0, 1.0);
+    let intersection = GlobePoint3 {
+        x: 0.0,
+        y: a.y + ((b.y - a.y) * t),
+        z: a.z + ((b.z - a.z) * t),
+    };
+    if a_front {
+        Some((a, intersection))
+    } else {
+        Some((intersection, b))
+    }
+}
+
+fn draw_geo_polyline(
+    ctx: &mut CanvasContext<'_>,
+    camera: &GlobeCamera,
+    coordinates: &[(f64, f64)],
+    color: Color,
+) {
+    if coordinates.len() < 2 {
+        return;
+    }
+    for segment in coordinates.windows(2) {
+        let (lon_a, lat_a) = segment[0];
+        let (lon_b, lat_b) = segment[1];
+        if !lon_a.is_finite()
+            || !lat_a.is_finite()
+            || !lon_b.is_finite()
+            || !lat_b.is_finite()
+            || (lon_a - lon_b).abs() > 180.0
+        {
+            continue;
+        }
+
+        let rotated_a = rotate_globe_point(lon_a, lat_a, camera);
+        let rotated_b = rotate_globe_point(lon_b, lat_b, camera);
+        let Some((clipped_a, clipped_b)) = clip_segment_to_front_hemisphere(rotated_a, rotated_b)
+        else {
+            continue;
+        };
+
+        let projected_a = project_globe_point(clipped_a, camera);
+        let projected_b = project_globe_point(clipped_b, camera);
+        ctx.draw(&CanvasLine {
+            x1: projected_a.x,
+            y1: projected_a.y,
+            x2: projected_b.x,
+            y2: projected_b.y,
+            color,
+        });
+    }
+}
+
+fn draw_globe_graticule(ctx: &mut CanvasContext<'_>, camera: &GlobeCamera) {
+    for lon in (-180..=180).step_by(30) {
+        let mut track = Vec::new();
+        for lat in (-84..=84).step_by(4) {
+            track.push((lon as f64, lat as f64));
+        }
+        draw_geo_polyline(ctx, camera, &track, Color::DarkGray);
+    }
+
+    for lat in (-60..=60).step_by(20) {
+        let mut track = Vec::new();
+        for lon in (-180..=180).step_by(4) {
+            track.push((lon as f64, lat as f64));
+        }
+        let color = if lat == 0 {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        };
+        draw_geo_polyline(ctx, camera, &track, color);
+    }
+}
+
+fn map_marker_visible(marker: &MapEventMarker, layers: &MapLayerState) -> bool {
+    match marker.kind {
+        MapEventKind::Earthquake => layers.earthquakes,
+        MapEventKind::Unrest => layers.unrest,
+    }
 }
 
 fn now_epoch_ms() -> i64 {
@@ -3239,6 +4037,47 @@ fn start_brief_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent
     });
 }
 
+fn start_map_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent>) {
+    if app.map_in_flight {
+        return;
+    }
+
+    app.map_in_flight = true;
+    app.status_line = "Refreshing globe overlays".to_string();
+
+    let country_centroids = app
+        .map_countries
+        .iter()
+        .map(|country| {
+            (
+                country.code.clone(),
+                (country.centroid_lon, country.centroid_lat),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let api = api.clone();
+    let sender = sender.clone();
+    thread::spawn(move || {
+        let snapshot = fetch_map_snapshot(&api, country_centroids);
+        let failed_all_sources = snapshot.fetched_sources == 0
+            && snapshot.earthquakes.is_empty()
+            && snapshot.unrest.is_empty();
+        let event = if failed_all_sources {
+            if snapshot.warnings.is_empty() {
+                WorkerEvent::MapFailure("Map refresh failed: no source returned data".to_string())
+            } else {
+                WorkerEvent::MapFailure(format!(
+                    "Map refresh failed: {}",
+                    snapshot.warnings.join(" | ")
+                ))
+            }
+        } else {
+            WorkerEvent::MapSuccess(snapshot)
+        };
+        let _ = sender.send(event);
+    });
+}
+
 fn apply_worker_events(app: &mut App, receiver: &Receiver<WorkerEvent>) {
     while let Ok(event) = receiver.try_recv() {
         match event {
@@ -3338,6 +4177,54 @@ fn apply_worker_events(app: &mut App, receiver: &Receiver<WorkerEvent>) {
                         snapshot.errors.len()
                     )
                 };
+            }
+            WorkerEvent::MapSuccess(result) => {
+                app.map_in_flight = false;
+                app.map_last_fetch_finished_at = Some(Instant::now());
+                let earthquakes_count = result.earthquakes.len();
+                let unrest_count = result.unrest.len();
+
+                let mut events = Vec::with_capacity(earthquakes_count + unrest_count);
+                events.extend(result.earthquakes);
+                events.extend(result.unrest);
+                events.sort_by(|left, right| {
+                    right
+                        .occurred_at
+                        .cmp(&left.occurred_at)
+                        .then_with(|| right.magnitude.total_cmp(&left.magnitude))
+                });
+                app.map_events = events;
+                if app.map_events.is_empty() {
+                    app.map_selected_event = 0;
+                } else if app.map_selected_event >= app.map_events.len() {
+                    app.map_selected_event = 0;
+                }
+
+                let warning_count = result.warnings.len();
+                app.map_last_fetch_summary = format!(
+                    "{} EQ | {} unrest | {} sources | {} warnings | {}ms",
+                    earthquakes_count,
+                    unrest_count,
+                    result.fetched_sources,
+                    warning_count,
+                    result.duration_ms
+                );
+
+                if warning_count == 0 {
+                    app.status_line = format!("Map updated with {} events", app.map_events.len());
+                } else {
+                    app.status_line = format!(
+                        "Map updated ({} events, {} warnings)",
+                        app.map_events.len(),
+                        warning_count
+                    );
+                }
+            }
+            WorkerEvent::MapFailure(error) => {
+                app.map_in_flight = false;
+                app.map_last_fetch_finished_at = Some(Instant::now());
+                app.map_last_fetch_summary = truncate_for_error(error.as_str(), 180);
+                app.status_line = "Map refresh failed".to_string();
             }
         }
     }
@@ -3505,6 +4392,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             workspace_tab(app.view == AppView::Rss, "RSS", "2"),
             workspace_tab(app.view == AppView::Brief, "BRIEF", "3"),
             workspace_tab(app.view == AppView::Settings, "SETTINGS", "4"),
+            workspace_tab(app.view == AppView::Map, "MAP", "5"),
             Span::styled("  Tab cycle", Style::default().fg(Color::DarkGray)),
         ])),
         vertical[0],
@@ -3515,15 +4403,17 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         AppView::Rss => draw_rss_workspace(frame, vertical[1], app),
         AppView::Brief => draw_brief_workspace(frame, vertical[1], app),
         AppView::Settings => draw_settings_workspace(frame, vertical[1], app),
+        AppView::Map => draw_map_workspace(frame, vertical[1], app),
     }
 
-    let footer_style = if app.in_flight || app.rss_in_flight || app.brief_in_flight {
-        Style::default().fg(Color::Yellow)
-    } else if app.editing_request || app.rss_editor_active() || app.brief_editor_active() {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Green)
-    };
+    let footer_style =
+        if app.in_flight || app.rss_in_flight || app.brief_in_flight || app.map_in_flight {
+            Style::default().fg(Color::Yellow)
+        } else if app.editing_request || app.rss_editor_active() || app.brief_editor_active() {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Green)
+        };
 
     let controls = match app.view {
         AppView::Api => {
@@ -3549,6 +4439,9 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         }
         AppView::Settings => {
             "SETTINGS | ↑/↓ select check | u/d detail scroll | g rescan keys | a auto | Tab cycle | q quit"
+        }
+        AppView::Map => {
+            "MAP | ←/→ yaw | ↑/↓ pitch | +/- zoom | r refresh | n/p select | Enter focus | b brief country | c/g/e/u/t layers | o auto-rotate | Tab cycle | q quit"
         }
     };
 
@@ -4242,6 +5135,284 @@ fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::R
     frame.render_widget(related_detail_panel, bottom[1]);
 }
 
+fn map_layer_span(label: &str, enabled: bool, on_color: Color) -> Span<'static> {
+    let value = if enabled { "on" } else { "off" };
+    let color = if enabled { on_color } else { Color::DarkGray };
+    Span::styled(
+        format!("{label}:{value}"),
+        Style::default().fg(color).add_modifier(if enabled {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        }),
+    )
+}
+
+fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(52), Constraint::Min(1)])
+        .split(area);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(11), Constraint::Min(8)])
+        .split(horizontal[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(12), Constraint::Length(9)])
+        .split(horizontal[1]);
+
+    let earthquake_count = app
+        .map_events
+        .iter()
+        .filter(|marker| marker.kind == MapEventKind::Earthquake)
+        .count();
+    let unrest_count = app
+        .map_events
+        .iter()
+        .filter(|marker| marker.kind == MapEventKind::Unrest)
+        .count();
+    let focused_country = if app.map_countries.iter().any(|country| {
+        country
+            .code
+            .eq_ignore_ascii_case(app.brief_country_code.as_str())
+    }) {
+        format!(
+            "{} ({})",
+            country_name_from_code(app.brief_country_code.as_str()),
+            app.brief_country_code
+        )
+    } else {
+        "n/a".to_string()
+    };
+    let map_status = if app.map_in_flight {
+        format!("{} refreshing map overlays...", spinner_symbol())
+    } else {
+        "idle".to_string()
+    };
+    let dashboard_lines = vec![
+        Line::from(vec![
+            Span::styled("Camera ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "yaw {:+06.1}  pitch {:+05.1}  zoom {:.2}",
+                    app.map_camera.yaw_deg, app.map_camera.pitch_deg, app.map_camera.zoom
+                ),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Layers ", Style::default().fg(Color::DarkGray)),
+            map_layer_span("country", app.map_layers.countries, Color::Cyan),
+            Span::raw(" "),
+            map_layer_span("grid", app.map_layers.graticule, Color::LightBlue),
+            Span::raw(" "),
+            map_layer_span("eq", app.map_layers.earthquakes, Color::Yellow),
+            Span::raw(" "),
+            map_layer_span("unrest", app.map_layers.unrest, Color::Red),
+        ]),
+        Line::from(vec![
+            Span::styled("Tier-1 ", Style::default().fg(Color::DarkGray)),
+            map_layer_span("highlight", app.map_layers.tier1, Color::LightCyan),
+            Span::raw("  "),
+            Span::styled("Auto-rotate ", Style::default().fg(Color::DarkGray)),
+            map_layer_span("spin", app.map_camera.auto_rotate, Color::Green),
+        ]),
+        Line::from(vec![
+            Span::styled("Events ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} total", app.map_events.len()),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled("  EQ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                earthquake_count.to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled("  Unrest ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                unrest_count.to_string(),
+                Style::default().fg(Color::LightRed),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Focus ", Style::default().fg(Color::DarkGray)),
+            Span::styled(focused_country, Style::default().fg(Color::LightGreen)),
+        ]),
+        Line::from(vec![
+            Span::styled("Status ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                map_status,
+                Style::default().fg(if app.map_in_flight {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            truncate_for_error(app.map_last_fetch_summary.as_str(), 90),
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            truncate_for_error(app.map_status_note.as_str(), 90),
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+    let dashboard = Paragraph::new(dashboard_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Map Dashboard"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(dashboard, left[0]);
+
+    let event_items: Vec<ListItem<'_>> = app
+        .map_events
+        .iter()
+        .enumerate()
+        .map(|(index, marker)| {
+            let enabled = map_marker_visible(marker, &app.map_layers);
+            let marker_color = if enabled {
+                map_marker_color(marker)
+            } else {
+                Color::DarkGray
+            };
+            let age = format_age(marker.occurred_at);
+            let label = format!(
+                "{} | {} | {}",
+                age,
+                marker_kind_label(marker.kind),
+                truncate_for_error(marker.title.as_str(), 34)
+            );
+            let mut style = Style::default().fg(marker_color);
+            if !enabled {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            if index == app.map_selected_event {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            ListItem::new(Line::from(vec![Span::styled(label, style)]))
+        })
+        .collect();
+    let event_list = List::new(event_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Signal Queue ({})", app.map_events.len())),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    let mut event_state = ListState::default();
+    if !app.map_events.is_empty() {
+        event_state.select(Some(app.map_selected_event));
+    }
+    frame.render_stateful_widget(event_list, left[1], &mut event_state);
+
+    let globe_radius = app.map_camera.zoom;
+    let globe = Canvas::default()
+        .block(Block::default().borders(Borders::ALL).title("World Globe"))
+        .marker(symbols::Marker::Braille)
+        .x_bounds([-2.2, 2.2])
+        .y_bounds([-1.4, 1.4])
+        .paint(|ctx| {
+            ctx.draw(&Circle {
+                x: 0.0,
+                y: 0.0,
+                radius: globe_radius,
+                color: Color::Blue,
+            });
+
+            if app.map_layers.graticule {
+                draw_globe_graticule(ctx, &app.map_camera);
+            }
+
+            if app.map_layers.countries {
+                for country in &app.map_countries {
+                    let mut country_color = Color::Gray;
+                    if app.map_layers.tier1 && is_tier1_country_code(country.code.as_str()) {
+                        country_color = Color::LightCyan;
+                    }
+                    if country
+                        .code
+                        .eq_ignore_ascii_case(app.brief_country_code.as_str())
+                    {
+                        country_color = Color::LightGreen;
+                    }
+                    for ring in &country.rings {
+                        draw_geo_polyline(ctx, &app.map_camera, ring, country_color);
+                    }
+                }
+            }
+
+            for (index, marker) in app.map_events.iter().enumerate() {
+                if !map_marker_visible(marker, &app.map_layers) {
+                    continue;
+                }
+                let rotated = rotate_globe_point(marker.lon, marker.lat, &app.map_camera);
+                if rotated.x < 0.0 {
+                    continue;
+                }
+                let projected = project_globe_point(rotated, &app.map_camera);
+                let coords = [(projected.x, projected.y)];
+                ctx.draw(&Points {
+                    coords: &coords,
+                    color: map_marker_color(marker),
+                });
+
+                if index == app.map_selected_event {
+                    let pulse = (0.03 + (rotated.x * 0.03)).clamp(0.03, 0.07);
+                    ctx.draw(&Circle {
+                        x: projected.x,
+                        y: projected.y,
+                        radius: pulse,
+                        color: Color::White,
+                    });
+                    ctx.draw(&CanvasLine {
+                        x1: projected.x - pulse,
+                        y1: projected.y,
+                        x2: projected.x + pulse,
+                        y2: projected.y,
+                        color: Color::White,
+                    });
+                }
+            }
+        });
+    frame.render_widget(globe, right[0]);
+
+    let detail_text = app
+        .map_events
+        .get(app.map_selected_event)
+        .map(|marker| {
+            format!(
+                "Type: {}  Age: {}\nTitle: {}\nContext: {}\nCoordinates: {:.3}, {:.3}\nID: {}\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | Enter focus | n/p cycle",
+                marker_kind_label(marker.kind),
+                format_age(marker.occurred_at),
+                marker.title,
+                marker.subtitle,
+                marker.lat,
+                marker.lon,
+                marker.id,
+            )
+        })
+        .unwrap_or_else(|| {
+            "No map events yet. Press r/f to refresh globe overlays.\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | o auto-rotate".to_string()
+        });
+    let detail_panel = Paragraph::new(detail_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Selected Signal"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail_panel, right[1]);
+}
+
 fn draw_settings_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
@@ -4419,6 +5590,10 @@ fn run_app(
         if app.should_auto_refresh_brief() {
             start_brief_fetch(&mut app, &api, &sender);
         }
+        if app.should_auto_refresh_map() {
+            start_map_fetch(&mut app, &api, &sender);
+        }
+        app.map_tick_auto_rotate();
         terminal
             .draw(|frame| draw_ui(frame, &app))
             .context("failed to draw TUI frame")?;
@@ -4460,6 +5635,9 @@ fn run_app(
                 if app.view == AppView::Api {
                     app.ensure_editor_synced();
                 }
+                if app.view == AppView::Map && app.map_events.is_empty() && !app.map_in_flight {
+                    start_map_fetch(&mut app, &api, &sender);
+                }
                 continue;
             }
 
@@ -4489,6 +5667,14 @@ fn run_app(
                 app.view = AppView::Settings;
                 app.status_line = "Switched to SETTINGS workspace".to_string();
                 app.refresh_settings(&api);
+                continue;
+            }
+            if key.code == KeyCode::Char('5') {
+                app.view = AppView::Map;
+                app.status_line = "Switched to MAP workspace".to_string();
+                if app.map_events.is_empty() && !app.map_in_flight {
+                    start_map_fetch(&mut app, &api, &sender);
+                }
                 continue;
             }
 
@@ -4580,6 +5766,39 @@ fn run_app(
                     KeyCode::Char('u') => app.settings_detail_scroll_up(),
                     KeyCode::Char('d') => app.settings_detail_scroll_down(),
                     KeyCode::Char('g') | KeyCode::Char('r') => app.refresh_settings(&api),
+                    KeyCode::Char('a') => app.toggle_auto_refresh(),
+                    _ => {}
+                },
+                AppView::Map => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Left => app.map_rotate_yaw(-4.0),
+                    KeyCode::Right => app.map_rotate_yaw(4.0),
+                    KeyCode::Up => app.map_rotate_pitch(3.0),
+                    KeyCode::Down => app.map_rotate_pitch(-3.0),
+                    KeyCode::Char('+') | KeyCode::Char('=') => app.map_zoom_in(),
+                    KeyCode::Char('-') | KeyCode::Char('_') => app.map_zoom_out(),
+                    KeyCode::Char('o') => app.map_toggle_auto_rotate(),
+                    KeyCode::Char('0') => app.map_reset_camera(),
+                    KeyCode::Char('r') | KeyCode::Char('f') => {
+                        start_map_fetch(&mut app, &api, &sender)
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('j') => app.map_select_next_event(),
+                    KeyCode::Char('p') | KeyCode::Char('k') => app.map_select_prev_event(),
+                    KeyCode::Enter => app.map_focus_selected_event(),
+                    KeyCode::Char('b') => {
+                        let country_code = app.brief_country_code.clone();
+                        if !app.map_focus_country(country_code.as_str()) {
+                            app.status_line = format!(
+                                "Country {} not found in local country boundaries",
+                                country_code
+                            );
+                        }
+                    }
+                    KeyCode::Char('c') => app.map_toggle_layer_countries(),
+                    KeyCode::Char('g') => app.map_toggle_layer_graticule(),
+                    KeyCode::Char('e') => app.map_toggle_layer_earthquakes(),
+                    KeyCode::Char('u') => app.map_toggle_layer_unrest(),
+                    KeyCode::Char('t') => app.map_toggle_layer_tier1(),
                     KeyCode::Char('a') => app.toggle_auto_refresh(),
                     _ => {}
                 },

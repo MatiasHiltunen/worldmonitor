@@ -79,6 +79,8 @@ mod tests {
             groq_api_key: None,
             acled_access_token: None,
             finnhub_api_key: None,
+            fred_api_key: None,
+            eia_api_key: None,
             request_timeout_ms: 500,
         };
         let http_client = reqwest::Client::builder()
@@ -337,5 +339,80 @@ mod tests {
         assert_eq!(get_response.status(), StatusCode::OK);
         let get_payload = response_json(get_response).await;
         assert_eq!(get_payload["learning"], true);
+    }
+
+    #[tokio::test]
+    async fn fred_endpoint_requires_series_id() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/economic/v1/get-fred-series")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"seriesId":""}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn world_bank_endpoint_requires_indicator_code() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/economic/v1/list-world-bank-indicators")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"indicatorCode":""}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn energy_endpoint_without_api_key_returns_empty_prices() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/economic/v1/get-energy-prices")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"commodities":["wti"]}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["prices"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn macro_signals_endpoint_returns_contract_shape() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/economic/v1/get-macro-signals")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("timestamp").is_some());
+        assert!(payload.get("verdict").is_some());
+        assert!(payload.get("signals").is_some());
+        assert!(payload.get("meta").is_some());
     }
 }

@@ -8,7 +8,9 @@ use serde::Serialize;
 
 use crate::{
     AppState,
-    domains::{infrastructure, infrastructure_ops, intelligence, market, seismology, unrest},
+    domains::{
+        economic, infrastructure, infrastructure_ops, intelligence, market, seismology, unrest,
+    },
 };
 
 #[derive(Debug, Serialize)]
@@ -120,6 +122,22 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/market/v1/list-crypto-quotes",
             post(market::list_crypto_quotes),
+        )
+        .route(
+            "/api/economic/v1/get-fred-series",
+            post(economic::get_fred_series),
+        )
+        .route(
+            "/api/economic/v1/list-world-bank-indicators",
+            post(economic::list_world_bank_indicators),
+        )
+        .route(
+            "/api/economic/v1/get-energy-prices",
+            post(economic::get_energy_prices),
+        )
+        .route(
+            "/api/economic/v1/get-macro-signals",
+            post(economic::get_macro_signals),
         )
         .fallback(not_found)
         .with_state(state)

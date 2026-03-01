@@ -43,8 +43,11 @@ use v3_rust_server::{
 const DEFAULT_CHATJIMMY_PACK_PATH: &str =
     "/data/data/com.termux/files/home/lega/tui_webflow/packs/chatjimmy_news_single.eon";
 const MAP_MIN_ZOOM: f64 = 0.55;
-const MAP_MAX_ZOOM: f64 = 8.0;
-const MAP_ZOOM_STEP: f64 = 0.08;
+const MAP_MAX_ZOOM: f64 = 14.0;
+const MAP_ZOOM_STEP: f64 = 0.06;
+const MAP_FAST_ZOOM_STEP: f64 = 0.45;
+const MAP_ROADS_MIN_VISIBLE_ZOOM: f64 = 5.4;
+const MAP_MAX_ROAD_SEGMENTS: usize = 12000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -522,10 +525,17 @@ impl Default for MapEventMarker {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct MapRoadSegment {
+    class: String,
+    points: Vec<(f64, f64)>, // lon, lat
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MapLayerState {
     countries: bool,
     graticule: bool,
+    roads: bool,
     earthquakes: bool,
     unrest: bool,
     tier1: bool,
@@ -536,6 +546,7 @@ impl Default for MapLayerState {
         Self {
             countries: true,
             graticule: true,
+            roads: true,
             earthquakes: true,
             unrest: true,
             tier1: true,
@@ -1406,9 +1417,11 @@ struct App {
     map_time_range: MapTimeRange,
     map_layers: MapLayerState,
     map_countries: Vec<MapCountryBoundary>,
+    map_roads: Vec<MapRoadSegment>,
     map_selected_event: usize,
     map_events: Vec<MapEventMarker>,
     map_status_note: String,
+    map_roads_note: String,
     transport_label: String,
     base_url_display: String,
     settings_checks: Vec<SettingsCheck>,
@@ -1439,6 +1452,11 @@ impl App {
         brief_country_editor.insert_str(brief_country_code.clone());
         let settings_checks = build_settings_checks(api);
         let (map_countries, map_status_note) = load_globe_boundaries();
+        let (map_roads, map_roads_note) = load_major_roads();
+        let mut map_layers = MapLayerState::default();
+        if map_roads.is_empty() {
+            map_layers.roads = false;
+        }
 
         let request_editor = build_request_editor(
             request_bodies
@@ -1521,11 +1539,13 @@ impl App {
             map_camera: GlobeCamera::default(),
             map_region_view: MapRegionView::Global,
             map_time_range: MapTimeRange::TwoDays,
-            map_layers: MapLayerState::default(),
+            map_layers,
             map_countries,
+            map_roads,
             map_selected_event: 0,
             map_events: Vec::new(),
             map_status_note,
+            map_roads_note,
             transport_label: api.transport_label().to_string(),
             base_url_display: api.base_url.clone(),
             settings_checks,
@@ -2031,6 +2051,18 @@ impl App {
         self.map_region_view = MapRegionView::Custom;
     }
 
+    fn map_zoom_fast_in(&mut self) {
+        self.map_camera.zoom =
+            (self.map_camera.zoom + MAP_FAST_ZOOM_STEP).clamp(MAP_MIN_ZOOM, MAP_MAX_ZOOM);
+        self.map_region_view = MapRegionView::Custom;
+    }
+
+    fn map_zoom_fast_out(&mut self) {
+        self.map_camera.zoom =
+            (self.map_camera.zoom - MAP_FAST_ZOOM_STEP).clamp(MAP_MIN_ZOOM, MAP_MAX_ZOOM);
+        self.map_region_view = MapRegionView::Custom;
+    }
+
     fn map_reset_camera(&mut self) {
         self.map_camera = GlobeCamera::default();
         self.map_region_view = MapRegionView::Global;
@@ -2061,6 +2093,20 @@ impl App {
             "Map layer enabled: graticule".to_string()
         } else {
             "Map layer disabled: graticule".to_string()
+        };
+    }
+
+    fn map_toggle_layer_roads(&mut self) {
+        if self.map_roads.is_empty() {
+            self.status_line =
+                "Road overlay unavailable (add public/data/roads-major.geojson)".to_string();
+            return;
+        }
+        self.map_layers.roads = !self.map_layers.roads;
+        self.status_line = if self.map_layers.roads {
+            "Map layer enabled: major roads".to_string()
+        } else {
+            "Map layer disabled: major roads".to_string()
         };
     }
 
@@ -2121,6 +2167,22 @@ impl App {
 
     fn map_cycle_region_prev(&mut self) {
         self.map_apply_region_view(self.map_region_view.prev());
+    }
+
+    fn map_yaw_step_deg(&self) -> f64 {
+        if self.map_camera.zoom >= 10.0 {
+            0.55
+        } else if self.map_camera.zoom >= 6.0 {
+            1.0
+        } else if self.map_camera.zoom >= 3.0 {
+            2.2
+        } else {
+            4.0
+        }
+    }
+
+    fn map_pitch_step_deg(&self) -> f64 {
+        (self.map_yaw_step_deg() * 0.75).max(0.45)
     }
 
     fn map_event_visible(&self, marker: &MapEventMarker) -> bool {
@@ -2881,6 +2943,18 @@ fn countries_geojson_path() -> PathBuf {
         .join("countries.geojson")
 }
 
+fn roads_geojson_candidate_paths() -> Vec<PathBuf> {
+    let data_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("public")
+        .join("data");
+    vec![
+        data_dir.join("roads-major.geojson"),
+        data_dir.join("major_roads.geojson"),
+        data_dir.join("roads.geojson"),
+    ]
+}
+
 fn simplify_country_ring(raw_ring: &[Vec<f64>]) -> Vec<(f64, f64)> {
     let mut points = raw_ring
         .iter()
@@ -2926,6 +3000,104 @@ fn simplify_country_ring(raw_ring: &[Vec<f64>]) -> Vec<(f64, f64)> {
         }
     }
     points
+}
+
+fn simplify_road_line(raw_line: &[Vec<f64>]) -> Vec<(f64, f64)> {
+    let mut points = raw_line
+        .iter()
+        .filter_map(|coord| {
+            if coord.len() < 2 {
+                return None;
+            }
+            let lon = coord[0];
+            let lat = coord[1];
+            if lon.is_finite() && lat.is_finite() {
+                Some((lon, lat))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if points.len() < 2 {
+        return Vec::new();
+    }
+
+    let epsilon = if points.len() > 1200 {
+        0.18
+    } else if points.len() > 600 {
+        0.12
+    } else if points.len() > 220 {
+        0.08
+    } else {
+        0.03
+    };
+    let linestring: LineString<f64> = points.iter().map(|(x, y)| (*x, *y)).collect();
+    let simplified = linestring.simplify(epsilon);
+    points = simplified
+        .points()
+        .map(|point| (point.x(), point.y()))
+        .collect();
+    points
+}
+
+fn road_class_from_properties(properties: Option<&Map<String, Value>>) -> String {
+    let keys = [
+        "fclass",
+        "class",
+        "highway",
+        "type",
+        "featurecla",
+        "name_en",
+    ];
+    for key in keys {
+        let Some(value) = properties.and_then(|props| props.get(key)) else {
+            continue;
+        };
+        if let Some(text) = value.as_str() {
+            let normalized = text.trim();
+            if !normalized.is_empty() {
+                return normalized.to_ascii_lowercase();
+            }
+        }
+    }
+    String::new()
+}
+
+fn road_is_major(class: &str) -> bool {
+    if class.is_empty() {
+        return true;
+    }
+    let major_tokens = [
+        "motorway",
+        "trunk",
+        "primary",
+        "expressway",
+        "highway",
+        "freeway",
+        "major",
+        "main",
+        "arterial",
+    ];
+    major_tokens.iter().any(|token| class.contains(token))
+}
+
+fn extract_road_lines(geometry: &geojson::Geometry) -> Vec<Vec<(f64, f64)>> {
+    match &geometry.value {
+        geojson::Value::LineString(line) => {
+            let simplified = simplify_road_line(line);
+            if simplified.len() >= 2 {
+                vec![simplified]
+            } else {
+                Vec::new()
+            }
+        }
+        geojson::Value::MultiLineString(lines) => lines
+            .iter()
+            .map(|line| simplify_road_line(line))
+            .filter(|line| line.len() >= 2)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn country_code_from_properties(
@@ -3072,10 +3244,114 @@ fn load_globe_boundaries() -> (Vec<MapCountryBoundary>, String) {
     (boundaries, note)
 }
 
+fn load_major_roads() -> (Vec<MapRoadSegment>, String) {
+    let Some(path) = roads_geojson_candidate_paths()
+        .into_iter()
+        .find(|candidate| candidate.exists())
+    else {
+        return (
+            Vec::new(),
+            "Major roads unavailable (optional: add public/data/roads-major.geojson)".to_string(),
+        );
+    };
+
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                Vec::new(),
+                format!(
+                    "Major roads read failed: {}",
+                    truncate_for_error(&error.to_string(), 120)
+                ),
+            );
+        }
+    };
+    let parsed = match text.parse::<GeoJson>() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                format!(
+                    "Major roads parse failed: {}",
+                    truncate_for_error(&error.to_string(), 120)
+                ),
+            );
+        }
+    };
+    let GeoJson::FeatureCollection(collection) = parsed else {
+        return (
+            Vec::new(),
+            "Major roads file did not contain a feature collection".to_string(),
+        );
+    };
+
+    let mut roads = Vec::new();
+    let mut skipped_non_major = 0usize;
+    for feature in collection.features {
+        let Some(geometry) = feature.geometry.as_ref() else {
+            continue;
+        };
+        let class = road_class_from_properties(feature.properties.as_ref());
+        if !road_is_major(&class) {
+            skipped_non_major += 1;
+            continue;
+        }
+        for points in extract_road_lines(geometry) {
+            roads.push(MapRoadSegment {
+                class: class.clone(),
+                points,
+            });
+            if roads.len() >= MAP_MAX_ROAD_SEGMENTS {
+                break;
+            }
+        }
+        if roads.len() >= MAP_MAX_ROAD_SEGMENTS {
+            break;
+        }
+    }
+
+    if roads.is_empty() {
+        return (
+            roads,
+            format!(
+                "Major roads loaded 0 segments from {}",
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("roads file")
+            ),
+        );
+    }
+
+    let note = format!(
+        "Loaded {} major road segments ({} non-major skipped) from {}",
+        roads.len(),
+        skipped_non_major,
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("roads file")
+    );
+    (roads, note)
+}
+
 fn marker_kind_label(kind: MapEventKind) -> &'static str {
     match kind {
         MapEventKind::Earthquake => "EQ",
         MapEventKind::Unrest => "UNREST",
+    }
+}
+
+fn map_road_color(class: &str) -> Color {
+    if class.contains("motorway")
+        || class.contains("trunk")
+        || class.contains("expressway")
+        || class.contains("freeway")
+    {
+        Color::White
+    } else if class.contains("primary") || class.contains("highway") {
+        Color::LightYellow
+    } else {
+        Color::Yellow
     }
 }
 
@@ -4707,7 +4983,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             "SETTINGS | ↑/↓ select check | u/d detail scroll | g rescan keys | a auto | Tab cycle | q quit"
         }
         AppView::Map => {
-            "MAP | ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | v/V region | r refresh | n/p select | Enter focus | y sync brief | b brief country | c/g/e/u/t layers | o auto-rotate | Tab cycle | q quit"
+            "MAP | ←/→ yaw | ↑/↓ pitch | +/- zoom | PgUp/PgDn fast zoom | [/] time | v/V region | r refresh | n/p select | Enter focus | y sync brief | b brief country | c/g/w/e/u/t layers | o auto-rotate | Tab cycle | q quit"
         }
     };
 
@@ -5421,7 +5697,7 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .split(area);
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(8)])
+        .constraints([Constraint::Length(14), Constraint::Min(8)])
         .split(horizontal[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -5486,6 +5762,8 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
             Span::raw(" "),
             map_layer_span("grid", app.map_layers.graticule, Color::LightBlue),
             Span::raw(" "),
+            map_layer_span("roads", app.map_layers.roads, Color::LightYellow),
+            Span::raw(" "),
             map_layer_span("eq", app.map_layers.earthquakes, Color::Yellow),
             Span::raw(" "),
             map_layer_span("unrest", app.map_layers.unrest, Color::Red),
@@ -5504,6 +5782,41 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
                 Style::default()
                     .fg(Color::LightMagenta)
                     .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Roads ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.map_layers.roads {
+                    if app.map_camera.zoom >= MAP_ROADS_MIN_VISIBLE_ZOOM {
+                        "visible"
+                    } else {
+                        "zoom in"
+                    }
+                } else {
+                    "off"
+                },
+                Style::default().fg(if app.map_layers.roads {
+                    if app.map_camera.zoom >= MAP_ROADS_MIN_VISIBLE_ZOOM {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled("min ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.1}", MAP_ROADS_MIN_VISIBLE_ZOOM),
+                Style::default().fg(Color::LightBlue),
+            ),
+            Span::raw("  "),
+            Span::styled("loaded ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.map_roads.len().to_string(),
+                Style::default().fg(Color::LightYellow),
             ),
         ]),
         Line::from(vec![
@@ -5548,6 +5861,10 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         )]),
         Line::from(vec![Span::styled(
             truncate_for_error(app.map_status_note.as_str(), 90),
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(vec![Span::styled(
+            truncate_for_error(app.map_roads_note.as_str(), 90),
             Style::default().fg(Color::DarkGray),
         )]),
     ];
@@ -5637,6 +5954,13 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
                 }
             }
 
+            if app.map_layers.roads && app.map_camera.zoom >= MAP_ROADS_MIN_VISIBLE_ZOOM {
+                for road in &app.map_roads {
+                    let road_color = map_road_color(road.class.as_str());
+                    draw_geo_polyline(ctx, &app.map_camera, road.points.as_slice(), road_color);
+                }
+            }
+
             for (index, marker) in app.map_events.iter().enumerate() {
                 if !app.map_event_visible(marker) {
                     continue;
@@ -5682,7 +6006,7 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
                 format!("Country: {}", marker.country_code)
             };
             format!(
-                "Type: {}  Age: {}\n{}\nTitle: {}\nContext: {}\nCoordinates: {:.3}, {:.3}\nID: {}\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | Enter focus | n/p cycle | y sync brief",
+                "Type: {}  Age: {}\n{}\nTitle: {}\nContext: {}\nCoordinates: {:.3}, {:.3}\nID: {}\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | PgUp/PgDn fast zoom | [/] time | Enter focus | n/p cycle | y sync brief",
                 marker_kind_label(marker.kind),
                 format_age(marker.occurred_at),
                 country_line,
@@ -5694,7 +6018,7 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
             )
         })
         .unwrap_or_else(|| {
-            "No map events for current filters. Press r/f to refresh globe overlays.\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | o auto-rotate".to_string()
+            "No map events for current filters. Press r/f to refresh globe overlays.\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | PgUp/PgDn fast zoom | [/] time | o auto-rotate".to_string()
         });
     let detail_panel = Paragraph::new(detail_text)
         .block(
@@ -6064,12 +6388,14 @@ fn run_app(
                 },
                 AppView::Map => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Left => app.map_rotate_yaw(-4.0),
-                    KeyCode::Right => app.map_rotate_yaw(4.0),
-                    KeyCode::Up => app.map_rotate_pitch(3.0),
-                    KeyCode::Down => app.map_rotate_pitch(-3.0),
+                    KeyCode::Left => app.map_rotate_yaw(-app.map_yaw_step_deg()),
+                    KeyCode::Right => app.map_rotate_yaw(app.map_yaw_step_deg()),
+                    KeyCode::Up => app.map_rotate_pitch(app.map_pitch_step_deg()),
+                    KeyCode::Down => app.map_rotate_pitch(-app.map_pitch_step_deg()),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.map_zoom_in(),
                     KeyCode::Char('-') | KeyCode::Char('_') => app.map_zoom_out(),
+                    KeyCode::PageUp | KeyCode::Char('>') => app.map_zoom_fast_in(),
+                    KeyCode::PageDown | KeyCode::Char('<') => app.map_zoom_fast_out(),
                     KeyCode::Char('[') => app.map_cycle_time_range_prev(),
                     KeyCode::Char(']') => app.map_cycle_time_range_next(),
                     KeyCode::Char('v') => app.map_cycle_region_next(),
@@ -6110,6 +6436,7 @@ fn run_app(
                     }
                     KeyCode::Char('c') => app.map_toggle_layer_countries(),
                     KeyCode::Char('g') => app.map_toggle_layer_graticule(),
+                    KeyCode::Char('w') => app.map_toggle_layer_roads(),
                     KeyCode::Char('e') => app.map_toggle_layer_earthquakes(),
                     KeyCode::Char('u') => app.map_toggle_layer_unrest(),
                     KeyCode::Char('t') => app.map_toggle_layer_tier1(),

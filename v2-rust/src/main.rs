@@ -20,7 +20,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_textarea::{Input as TextInput, TextArea};
@@ -124,6 +124,7 @@ enum AppView {
     Api,
     Rss,
     Brief,
+    Settings,
 }
 
 impl AppView {
@@ -131,7 +132,8 @@ impl AppView {
         match self {
             AppView::Api => AppView::Rss,
             AppView::Rss => AppView::Brief,
-            AppView::Brief => AppView::Api,
+            AppView::Brief => AppView::Settings,
+            AppView::Settings => AppView::Api,
         }
     }
 }
@@ -405,6 +407,15 @@ struct BriefSnapshot {
     errors: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct SettingsCheck {
+    capability: String,
+    key_names: String,
+    required: bool,
+    configured: bool,
+    note: String,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct CountryIntelBriefResponse {
@@ -641,6 +652,20 @@ impl ApiClient {
         )?;
         serde_json::from_value(payload).context("failed to decode country stock index response")
     }
+
+    fn transport_label(&self) -> &'static str {
+        match &self.transport {
+            ApiTransport::Http => "http",
+            ApiTransport::Library(_) => "library",
+        }
+    }
+
+    fn cli_api_key_present(&self) -> bool {
+        self.api_key
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }
 }
 
 fn looks_like_local_base_url(base_url: &str) -> bool {
@@ -649,6 +674,99 @@ fn looks_like_local_base_url(base_url: &str) -> bool {
         || lower.starts_with("http://localhost:")
         || lower == "http://127.0.0.1"
         || lower == "http://localhost"
+}
+
+fn env_key_present(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn any_env_key_present(names: &[&str]) -> bool {
+    names.iter().any(|name| env_key_present(name))
+}
+
+fn build_settings_checks(api: &ApiClient) -> Vec<SettingsCheck> {
+    let remote_http =
+        matches!(api.transport, ApiTransport::Http) && !looks_like_local_base_url(&api.base_url);
+    let has_ollama_url = env_key_present("OLLAMA_API_URL");
+    let ollama_ready = has_ollama_url;
+
+    vec![
+        SettingsCheck {
+            capability: "Protected HTTP API access".to_string(),
+            key_names: "WORLDMONITOR_API_KEY / --api-key".to_string(),
+            required: remote_http,
+            configured: api.cli_api_key_present() || env_key_present("WORLDMONITOR_API_KEY"),
+            note: if remote_http {
+                "Required for many remote hosts when using HTTP mode.".to_string()
+            } else {
+                "Optional in local library mode.".to_string()
+            },
+        },
+        SettingsCheck {
+            capability: "Intel BRIEF model enrichment".to_string(),
+            key_names: "GROQ_API_KEY".to_string(),
+            required: true,
+            configured: env_key_present("GROQ_API_KEY"),
+            note: "Missing key can return empty/generated fallback brief text.".to_string(),
+        },
+        SettingsCheck {
+            capability: "Conflict ACLED feeds".to_string(),
+            key_names: "ACLED_ACCESS_TOKEN".to_string(),
+            required: false,
+            configured: env_key_present("ACLED_ACCESS_TOKEN"),
+            note: "Optional but improves unrest/conflict completeness.".to_string(),
+        },
+        SettingsCheck {
+            capability: "Market quote enrichment".to_string(),
+            key_names: "FINNHUB_API_KEY".to_string(),
+            required: false,
+            configured: env_key_present("FINNHUB_API_KEY"),
+            note: "Optional for richer market endpoints.".to_string(),
+        },
+        SettingsCheck {
+            capability: "Economic indicators".to_string(),
+            key_names: "FRED_API_KEY + EIA_API_KEY".to_string(),
+            required: false,
+            configured: env_key_present("FRED_API_KEY") && env_key_present("EIA_API_KEY"),
+            note: "Both keys recommended for full economic coverage.".to_string(),
+        },
+        SettingsCheck {
+            capability: "Military aircraft enrichment".to_string(),
+            key_names: "WINGBITS_API_KEY".to_string(),
+            required: false,
+            configured: env_key_present("WINGBITS_API_KEY"),
+            note: "Needed for Wingbits details/batch endpoints.".to_string(),
+        },
+        SettingsCheck {
+            capability: "Wildfire detections (FIRMS)".to_string(),
+            key_names: "NASA_FIRMS_API_KEY or FIRMS_API_KEY".to_string(),
+            required: false,
+            configured: any_env_key_present(&["NASA_FIRMS_API_KEY", "FIRMS_API_KEY"]),
+            note: "Without this, wildfire endpoint returns empty detections.".to_string(),
+        },
+        SettingsCheck {
+            capability: "Cyber threat optional feeds".to_string(),
+            key_names: "URLHAUS_AUTH_KEY / OTX_API_KEY / ABUSEIPDB_API_KEY".to_string(),
+            required: false,
+            configured: any_env_key_present(&[
+                "URLHAUS_AUTH_KEY",
+                "OTX_API_KEY",
+                "ABUSEIPDB_API_KEY",
+            ]),
+            note: "At least one key enables additional cyber feed sources.".to_string(),
+        },
+        SettingsCheck {
+            capability: "News summarization providers".to_string(),
+            key_names: "OLLAMA_API_URL or OPENROUTER_API_KEY or GROQ_API_KEY".to_string(),
+            required: false,
+            configured: ollama_ready
+                || env_key_present("OPENROUTER_API_KEY")
+                || env_key_present("GROQ_API_KEY"),
+            note: "Configure one provider for summarize-article endpoint.".to_string(),
+        },
+    ]
 }
 
 struct App {
@@ -697,10 +815,15 @@ struct App {
     brief_related_selected: usize,
     brief_brief_scroll: u16,
     brief_news_scroll: u16,
+    transport_label: String,
+    base_url_display: String,
+    settings_checks: Vec<SettingsCheck>,
+    settings_selected: usize,
+    settings_detail_scroll: u16,
 }
 
 impl App {
-    fn new(refresh_interval: Option<Duration>) -> Self {
+    fn new(refresh_interval: Option<Duration>, api: &ApiClient) -> Self {
         let endpoints: Vec<Endpoint> = Endpoint::iter().collect();
         let selected = 0;
         let selected_endpoint = endpoints[selected];
@@ -720,6 +843,7 @@ impl App {
         let mut brief_country_editor =
             build_single_line_editor("Country code (ISO-2, Enter apply, Esc cancel)");
         brief_country_editor.insert_str(brief_country_code.clone());
+        let settings_checks = build_settings_checks(api);
 
         let request_editor = build_request_editor(
             request_bodies
@@ -740,7 +864,7 @@ impl App {
                 template_source,
                 String::new(),
                 "Use Up/Down to choose endpoint, Enter/r to fetch.".to_string(),
-                "Press Tab to switch API/RSS/BRIEF workspaces.".to_string(),
+                "Press Tab to switch API/RSS/BRIEF/SETTINGS workspaces.".to_string(),
                 "Press e to edit request JSON, a to toggle auto-refresh.".to_string(),
                 "Press t to reset current request body to template.".to_string(),
                 "Use j/k to scroll response, q or Esc to quit.".to_string(),
@@ -795,6 +919,11 @@ impl App {
             brief_related_selected: 0,
             brief_brief_scroll: 0,
             brief_news_scroll: 0,
+            transport_label: api.transport_label().to_string(),
+            base_url_display: api.base_url.clone(),
+            settings_checks,
+            settings_selected: 0,
+            settings_detail_scroll: 0,
         }
     }
 
@@ -917,6 +1046,10 @@ impl App {
             }
             AppView::Brief => {
                 self.status_line = "Switched to BRIEF workspace".to_string();
+            }
+            AppView::Settings => {
+                self.status_line =
+                    "Switched to SETTINGS workspace (API key/provider audit)".to_string();
             }
         }
     }
@@ -1208,6 +1341,47 @@ impl App {
         self.brief_news_scroll = self.brief_news_scroll.saturating_sub(1);
     }
 
+    fn refresh_settings(&mut self, api: &ApiClient) {
+        self.settings_checks = build_settings_checks(api);
+        if self.settings_checks.is_empty() {
+            self.settings_selected = 0;
+        } else if self.settings_selected >= self.settings_checks.len() {
+            self.settings_selected = self.settings_checks.len().saturating_sub(1);
+        }
+        self.settings_detail_scroll = 0;
+        self.status_line = "Refreshed API key and provider configuration audit".to_string();
+    }
+
+    fn settings_select_next(&mut self) {
+        if self.settings_checks.is_empty() {
+            self.settings_selected = 0;
+            return;
+        }
+        self.settings_selected = (self.settings_selected + 1) % self.settings_checks.len();
+        self.settings_detail_scroll = 0;
+    }
+
+    fn settings_select_prev(&mut self) {
+        if self.settings_checks.is_empty() {
+            self.settings_selected = 0;
+            return;
+        }
+        if self.settings_selected == 0 {
+            self.settings_selected = self.settings_checks.len() - 1;
+        } else {
+            self.settings_selected -= 1;
+        }
+        self.settings_detail_scroll = 0;
+    }
+
+    fn settings_detail_scroll_down(&mut self) {
+        self.settings_detail_scroll = self.settings_detail_scroll.saturating_add(1);
+    }
+
+    fn settings_detail_scroll_up(&mut self) {
+        self.settings_detail_scroll = self.settings_detail_scroll.saturating_sub(1);
+    }
+
     fn should_auto_refresh_api(&self) -> bool {
         let Some(interval) = self.refresh_interval else {
             return false;
@@ -1274,6 +1448,7 @@ impl App {
             AppView::Api => self.last_fetch_finished_at,
             AppView::Rss => self.rss_last_fetch_finished_at,
             AppView::Brief => self.brief_last_fetch_finished_at,
+            AppView::Settings => None,
         };
 
         let remaining = match base {
@@ -2612,6 +2787,25 @@ fn handle_brief_input_key(
     }
 }
 
+fn workspace_tab(active: bool, label: &str, hotkey: &str) -> Span<'static> {
+    let content = if active {
+        format!(" [{}:{}] ", hotkey, label)
+    } else {
+        format!("  {}:{}  ", hotkey, label)
+    };
+    if active {
+        Span::styled(
+            content,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(content, Style::default().fg(Color::DarkGray))
+    }
+}
+
 fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -2623,13 +2817,20 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(area);
 
-    let tabs = match app.view {
-        AppView::Api => "Workspace: [ API ]  RSS    BRIEF   (Tab switch)",
-        AppView::Rss => "Workspace:   API  [ RSS ]  BRIEF   (Tab switch)",
-        AppView::Brief => "Workspace:   API    RSS   [ BRIEF ] (Tab switch)",
-    };
     frame.render_widget(
-        Paragraph::new(tabs).style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Workspaces ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            workspace_tab(app.view == AppView::Api, "API", "1"),
+            workspace_tab(app.view == AppView::Rss, "RSS", "2"),
+            workspace_tab(app.view == AppView::Brief, "BRIEF", "3"),
+            workspace_tab(app.view == AppView::Settings, "SETTINGS", "4"),
+            Span::styled("  Tab cycle", Style::default().fg(Color::DarkGray)),
+        ])),
         vertical[0],
     );
 
@@ -2637,6 +2838,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         AppView::Api => draw_api_workspace(frame, vertical[1], app),
         AppView::Rss => draw_rss_workspace(frame, vertical[1], app),
         AppView::Brief => draw_brief_workspace(frame, vertical[1], app),
+        AppView::Settings => draw_settings_workspace(frame, vertical[1], app),
     }
 
     let footer_style = if app.in_flight || app.rss_in_flight || app.brief_in_flight {
@@ -2669,6 +2871,9 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
                 "BRIEF | n/p country | c edit code | Enter/r/f refresh | x export | j/k brief scroll | ↑/↓ RSS | u/d RSS detail | a auto | Tab cycle | q quit"
             }
         }
+        AppView::Settings => {
+            "SETTINGS | ↑/↓ select check | u/d detail scroll | g rescan keys | a auto | Tab cycle | q quit"
+        }
     };
 
     let footer = Paragraph::new(format!(
@@ -2682,6 +2887,80 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(footer, vertical[2]);
 }
 
+fn age_color(ts_ms: i64) -> Color {
+    if ts_ms <= 0 {
+        return Color::DarkGray;
+    }
+    let delta_sec = (now_epoch_ms().saturating_sub(ts_ms) / 1000).max(0);
+    if delta_sec <= 20 * 60 {
+        Color::Green
+    } else if delta_sec <= 2 * 3600 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    }
+}
+
+fn sentiment_color(value: &str) -> Color {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("critical") || lower.contains("high") || lower.contains("severe") {
+        Color::Red
+    } else if lower.contains("medium")
+        || lower.contains("moderate")
+        || lower.contains("elevated")
+        || lower.contains("watch")
+    {
+        Color::Yellow
+    } else if lower.contains("low")
+        || lower.contains("normal")
+        || lower.contains("stable")
+        || lower.contains("operational")
+    {
+        Color::Green
+    } else {
+        Color::Cyan
+    }
+}
+
+fn signed_value_color(value: f64) -> Color {
+    if value > 0.0 {
+        Color::Green
+    } else if value < 0.0 {
+        Color::Red
+    } else {
+        Color::DarkGray
+    }
+}
+
+fn settings_status_style(required: bool, configured: bool) -> Style {
+    match (required, configured) {
+        (true, true) => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        (true, false) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        (false, true) => Style::default().fg(Color::LightGreen),
+        (false, false) => Style::default().fg(Color::Yellow),
+    }
+}
+
+fn settings_status_label(required: bool, configured: bool) -> &'static str {
+    match (required, configured) {
+        (true, true) => "READY",
+        (true, false) => "MISSING",
+        (false, true) => "OPTIONAL-READY",
+        (false, false) => "OPTIONAL-MISSING",
+    }
+}
+
+fn endpoint_style(endpoint: Endpoint) -> Style {
+    match endpoint {
+        Endpoint::SeismologyEarthquakes => Style::default().fg(Color::LightMagenta),
+        Endpoint::UnrestEvents => Style::default().fg(Color::LightRed),
+        Endpoint::InfrastructureStatuses => Style::default().fg(Color::LightCyan),
+        Endpoint::MarketCryptoQuotes => Style::default().fg(Color::LightGreen),
+    }
+}
+
 fn draw_api_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
@@ -2689,13 +2968,22 @@ fn draw_api_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .split(area);
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(12)])
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(12),
+        ])
         .split(horizontal[1]);
 
     let endpoint_items: Vec<ListItem<'_>> = app
         .endpoints
         .iter()
-        .map(|endpoint| ListItem::new(endpoint.to_string()))
+        .map(|endpoint| {
+            ListItem::new(Line::from(vec![Span::styled(
+                endpoint.to_string(),
+                endpoint_style(*endpoint),
+            )]))
+        })
         .collect();
 
     let endpoint_list = List::new(endpoint_items)
@@ -2715,6 +3003,50 @@ fn draw_api_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
     list_state.select(Some(app.selected));
     frame.render_stateful_widget(endpoint_list, horizontal[0], &mut list_state);
 
+    let api_dashboard = vec![
+        Line::from(vec![
+            Span::styled("Transport ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.transport_label.as_str(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Mode ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.in_flight { "FETCHING" } else { "IDLE" },
+                Style::default().fg(if app.in_flight {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Endpoint ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.selected_endpoint().path(),
+                Style::default().fg(Color::LightBlue),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Base ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.base_url_display.as_str(),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    ];
+    let api_dashboard_panel = Paragraph::new(api_dashboard)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("API Dashboard"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(api_dashboard_panel, right_chunks[0]);
+
     let result_text = Text::from(
         app.output_lines
             .iter()
@@ -2725,10 +3057,10 @@ fn draw_api_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .block(Block::default().borders(Borders::ALL).title("Response"))
         .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0));
-    frame.render_widget(result_panel, right_chunks[0]);
+    frame.render_widget(result_panel, right_chunks[1]);
 
     if app.editing_request {
-        frame.render_widget(&app.request_editor, right_chunks[1]);
+        frame.render_widget(&app.request_editor, right_chunks[2]);
     } else {
         let request_preview = Paragraph::new(app.current_saved_request_body().to_string())
             .block(Block::default().borders(Borders::ALL).title(format!(
@@ -2736,7 +3068,7 @@ fn draw_api_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
                 app.selected_endpoint().path()
             )))
             .wrap(Wrap { trim: false });
-        frame.render_widget(request_preview, right_chunks[1]);
+        frame.render_widget(request_preview, right_chunks[2]);
     }
 }
 
@@ -2755,36 +3087,100 @@ fn draw_rss_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
     } else {
         app.rss_spikes.join(" | ")
     };
+    let now = Instant::now();
+    let cooldown_count = app
+        .rss_feed_health
+        .values()
+        .filter(|health| {
+            health
+                .cooldown_until
+                .as_ref()
+                .map(|until| *until > now)
+                .unwrap_or(false)
+        })
+        .count();
+    let failing_count = app
+        .rss_feed_health
+        .values()
+        .filter(|health| health.consecutive_failures > 0)
+        .count();
+    let healthy_count = app
+        .rss_feed_health
+        .values()
+        .filter(|health| health.consecutive_failures == 0 && health.last_success.is_some())
+        .count();
+
+    let search_label = if app.rss_query.is_empty() {
+        "<none>".to_string()
+    } else {
+        app.rss_query.clone()
+    };
+    let keywords_label = if app.rss_keywords.is_empty() {
+        "<none>".to_string()
+    } else {
+        app.rss_keywords.join(", ")
+    };
+
     let control_lines = vec![
-        format!("Variant: {} (v)", app.rss_variant),
-        format!("Category: {} (←/→)", app.current_rss_category()),
-        format!(
-            "Search: {} (/ edit, t clear)",
-            if app.rss_query.is_empty() {
-                "<none>".to_string()
-            } else {
-                app.rss_query.clone()
-            }
-        ),
-        format!(
-            "Keywords: {} (m edit)",
-            if app.rss_keywords.is_empty() {
-                "<none>".to_string()
-            } else {
-                app.rss_keywords.join(", ")
-            }
-        ),
-        String::new(),
-        format!(
-            "Feeds tracked: {}",
-            feed_sources_for_variant(app.rss_variant).len()
-        ),
-        app.rss_last_fetch_summary.clone(),
-        format!("Spikes: {}", spikes),
+        Line::from(vec![
+            Span::styled("Variant ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.rss_variant.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Category ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.current_rss_category(),
+                Style::default().fg(Color::LightBlue),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Search ", Style::default().fg(Color::DarkGray)),
+            Span::styled(search_label, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Keywords ", Style::default().fg(Color::DarkGray)),
+            Span::styled(keywords_label, Style::default().fg(Color::Magenta)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Feeds ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                feed_sources_for_variant(app.rss_variant).len().to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("  "),
+            Span::styled("Healthy ", Style::default().fg(Color::DarkGray)),
+            Span::styled(healthy_count.to_string(), Style::default().fg(Color::Green)),
+            Span::raw("  "),
+            Span::styled("Failing ", Style::default().fg(Color::DarkGray)),
+            Span::styled(failing_count.to_string(), Style::default().fg(Color::Red)),
+            Span::raw("  "),
+            Span::styled("Cooldown ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                cooldown_count.to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            app.rss_last_fetch_summary.clone(),
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![
+            Span::styled("Spikes ", Style::default().fg(Color::DarkGray)),
+            Span::styled(spikes, Style::default().fg(Color::LightYellow)),
+        ]),
     ];
 
-    let left_panel = Paragraph::new(control_lines.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title("RSS Controls"))
+    let left_panel = Paragraph::new(control_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("RSS Dashboard"),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(left_panel, horizontal[0]);
 
@@ -2792,18 +3188,25 @@ fn draw_rss_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .rss_view_items
         .iter()
         .map(|item| {
+            let age = format_age(item.published_ts_ms);
             let marker = if item.keyword_hits.is_empty() {
-                String::new()
+                Span::raw("")
             } else {
-                format!(" [{}]", item.keyword_hits.join(","))
+                Span::styled(
+                    format!("  [{}]", item.keyword_hits.join(",")),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )
             };
-            ListItem::new(format!(
-                "{} | {} | {}{}",
-                format_age(item.published_ts_ms),
-                item.source_name,
-                item.title,
-                marker
-            ))
+            ListItem::new(Line::from(vec![
+                Span::styled(age, Style::default().fg(age_color(item.published_ts_ms))),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(item.source_name.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(item.title.clone(), Style::default().fg(Color::White)),
+                marker,
+            ]))
         })
         .collect();
 
@@ -2895,6 +3298,8 @@ fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::R
     let strategic = snapshot
         .map(|snap| compact_enum_label(snap.strategic_level.as_str()).to_string())
         .unwrap_or_else(|| "n/a".to_string());
+    let cii_trend_color = sentiment_color(&cii_trend);
+    let strategic_color = sentiment_color(&strategic);
     let stock_line = snapshot
         .map(|snap| {
             if snap.stock_available {
@@ -2931,27 +3336,91 @@ fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::R
         })
         .unwrap_or_else(|| vec!["Warnings: none".to_string()]);
 
+    let cii_value = snapshot.and_then(|snap| snap.cii_score).unwrap_or_default();
+    let cii_color = if snapshot.is_none() {
+        Color::DarkGray
+    } else if cii_value >= 70.0 {
+        Color::Red
+    } else if cii_value >= 40.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+
     let mut overview_lines = vec![
-        format!("Country: {} ({})", country_name, country_code),
-        format!("CII: {} | Trend: {}", cii_score, cii_trend),
-        format!("Strategic: {}", strategic),
-        format!("Stock: {}", stock_line),
-        format!("Intel age: {}", intel_age),
-        format!("Related RSS: {}", app.brief_related_rss.len()),
-        if app.brief_in_flight {
-            format!("Status: {} refreshing brief...", spinner_symbol())
-        } else {
-            "Status: idle".to_string()
-        },
-        app.brief_last_fetch_summary.clone(),
-        String::new(),
+        Line::from(vec![
+            Span::styled("Country ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ({})", country_name, country_code),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("CII ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cii_score, Style::default().fg(cii_color)),
+            Span::styled("  Trend ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cii_trend.clone(), Style::default().fg(cii_trend_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("Strategic ", Style::default().fg(Color::DarkGray)),
+            Span::styled(strategic.clone(), Style::default().fg(strategic_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("Stock ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                stock_line,
+                Style::default().fg(signed_value_color(
+                    snapshot.map(|snap| snap.stock_week_change).unwrap_or(0.0),
+                )),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Intel age ", Style::default().fg(Color::DarkGray)),
+            Span::styled(intel_age, Style::default().fg(Color::LightBlue)),
+        ]),
+        Line::from(vec![
+            Span::styled("Related RSS ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.brief_related_rss.len().to_string(),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Status ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.brief_in_flight {
+                    format!("{} refreshing brief...", spinner_symbol())
+                } else {
+                    "idle".to_string()
+                },
+                Style::default().fg(if app.brief_in_flight {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            app.brief_last_fetch_summary.clone(),
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::raw(""),
     ];
-    overview_lines.extend(warning_lines);
-    let overview = Paragraph::new(overview_lines.join("\n"))
+    overview_lines.extend(warning_lines.into_iter().map(|line| {
+        let color = if line.starts_with("Warnings:") {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        Line::from(vec![Span::styled(line, Style::default().fg(color))])
+    }));
+    let overview = Paragraph::new(overview_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("BRIEF Overview"),
+                .title("BRIEF Dashboard"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(overview, horizontal[0]);
@@ -3021,12 +3490,16 @@ fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::R
         .brief_related_rss
         .iter()
         .map(|item| {
-            ListItem::new(format!(
-                "{} | {} | {}",
-                format_age(item.published_ts_ms),
-                item.source_name,
-                item.title
-            ))
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format_age(item.published_ts_ms),
+                    Style::default().fg(age_color(item.published_ts_ms)),
+                ),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(item.source_name.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(item.title.clone(), Style::default().fg(Color::White)),
+            ]))
         })
         .collect();
     let related_list = List::new(related_items)
@@ -3080,12 +3553,168 @@ fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::R
     frame.render_widget(related_detail_panel, bottom[1]);
 }
 
+fn draw_settings_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(62), Constraint::Min(1)])
+        .split(area);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(1)])
+        .split(horizontal[0]);
+
+    let required_total = app
+        .settings_checks
+        .iter()
+        .filter(|item| item.required)
+        .count();
+    let required_missing = app
+        .settings_checks
+        .iter()
+        .filter(|item| item.required && !item.configured)
+        .count();
+    let optional_total = app.settings_checks.len().saturating_sub(required_total);
+    let optional_missing = app
+        .settings_checks
+        .iter()
+        .filter(|item| !item.required && !item.configured)
+        .count();
+
+    let dashboard_lines = vec![
+        Line::from(vec![
+            Span::styled("Transport ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.transport_label.as_str(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Base ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.base_url_display.as_str(),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Required keys ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} ready / {} missing",
+                    required_total.saturating_sub(required_missing),
+                    required_missing
+                ),
+                Style::default().fg(if required_missing > 0 {
+                    Color::Red
+                } else {
+                    Color::Green
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Optional keys ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} ready / {} missing",
+                    optional_total.saturating_sub(optional_missing),
+                    optional_missing
+                ),
+                Style::default().fg(if optional_missing > 0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
+        ]),
+    ];
+    let dashboard = Paragraph::new(dashboard_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Configuration Dashboard"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(dashboard, left[0]);
+
+    let key_rows: Vec<ListItem<'_>> = app
+        .settings_checks
+        .iter()
+        .map(|check| {
+            let style = settings_status_style(check.required, check.configured);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{:<16}",
+                        settings_status_label(check.required, check.configured)
+                    ),
+                    style,
+                ),
+                Span::styled(" ", Style::default().fg(Color::DarkGray)),
+                Span::styled(check.capability.clone(), Style::default().fg(Color::White)),
+            ]))
+        })
+        .collect();
+    let key_list = List::new(key_rows)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("API Key Audit"),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    let mut key_state = ListState::default();
+    if !app.settings_checks.is_empty() {
+        key_state.select(Some(app.settings_selected));
+    }
+    frame.render_stateful_widget(key_list, left[1], &mut key_state);
+
+    let detail_text = app
+        .settings_checks
+        .get(app.settings_selected)
+        .map(|check| {
+            let status = settings_status_label(check.required, check.configured);
+            format!(
+                "Capability: {}\n\nStatus: {}\nRequirement: {}\nKeys: {}\n\n{}\n\nAction:\n{}",
+                check.capability,
+                status,
+                if check.required {
+                    "Required"
+                } else {
+                    "Optional"
+                },
+                check.key_names,
+                check.note,
+                if check.configured {
+                    "Configuration detected. No action needed."
+                } else if check.required {
+                    "Set the key/env and restart the TUI for full functionality."
+                } else {
+                    "Optional; add key to unlock enhanced data quality."
+                }
+            )
+        })
+        .unwrap_or_else(|| "No key checks available.".to_string());
+    let detail_panel = Paragraph::new(detail_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Selected Capability"),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.settings_detail_scroll, 0));
+    frame.render_widget(detail_panel, horizontal[1]);
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     api: ApiClient,
     refresh_interval: Option<Duration>,
 ) -> Result<()> {
-    let mut app = App::new(refresh_interval);
+    let mut app = App::new(refresh_interval, &api);
     let (sender, receiver) = mpsc::channel::<WorkerEvent>();
 
     start_api_fetch(&mut app, &api, &sender);
@@ -3142,6 +3771,35 @@ fn run_app(
                 if app.view == AppView::Api {
                     app.ensure_editor_synced();
                 }
+                continue;
+            }
+
+            if key.code == KeyCode::Char('1') {
+                app.view = AppView::Api;
+                app.status_line = "Switched to API workspace".to_string();
+                app.ensure_editor_synced();
+                continue;
+            }
+            if key.code == KeyCode::Char('2') {
+                app.view = AppView::Rss;
+                app.status_line = "Switched to RSS workspace".to_string();
+                if app.rss_items.is_empty() && !app.rss_in_flight {
+                    start_rss_fetch(&mut app, &api, &sender);
+                }
+                continue;
+            }
+            if key.code == KeyCode::Char('3') {
+                app.view = AppView::Brief;
+                app.status_line = "Switched to BRIEF workspace".to_string();
+                if app.brief_snapshot.is_none() && !app.brief_in_flight {
+                    start_brief_fetch(&mut app, &api, &sender);
+                }
+                continue;
+            }
+            if key.code == KeyCode::Char('4') {
+                app.view = AppView::Settings;
+                app.status_line = "Switched to SETTINGS workspace".to_string();
+                app.refresh_settings(&api);
                 continue;
             }
 
@@ -3224,6 +3882,16 @@ fn run_app(
                     KeyCode::Char('k') => app.brief_scroll_up(),
                     KeyCode::Char('u') => app.brief_news_scroll_up(),
                     KeyCode::Char('d') => app.brief_news_scroll_down(),
+                    _ => {}
+                },
+                AppView::Settings => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Up | KeyCode::Char('k') => app.settings_select_prev(),
+                    KeyCode::Down | KeyCode::Char('j') => app.settings_select_next(),
+                    KeyCode::Char('u') => app.settings_detail_scroll_up(),
+                    KeyCode::Char('d') => app.settings_detail_scroll_down(),
+                    KeyCode::Char('g') | KeyCode::Char('r') => app.refresh_settings(&api),
+                    KeyCode::Char('a') => app.toggle_auto_refresh(),
                     _ => {}
                 },
             }

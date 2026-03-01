@@ -7,7 +7,8 @@ Searched with `cargo search` and verified details via `cargo info`.
 - `ratatui` (`0.30.0`): core TUI framework.
 - `crossterm` (`0.29.0`): terminal events/raw mode and alternate screen support.
 - `ratatui-textarea` (`0.8.0`): request-body editor widget (avoids custom text-edit implementation).
-- `reqwest` (`0.13.2`, blocking+json): simple HTTP + JSON without async runtime complexity.
+- `feed-rs` (`2.3.1`): parse RSS/Atom feeds for the TUI RSS workspace.
+- `reqwest` (`0.13.2`, blocking+json+native-tls): simple HTTP + JSON without async runtime complexity and stable TLS behavior on Termux/Android.
 - `serde` (`1.0.228`) + `serde_json` (`1.0.149`): typed API decoding.
 - `clap` (`4.5.60`): small CLI surface (`--base-url`, `--api-key`, timeout).
 - `anyhow` (`1.0.102`): context-rich error handling with low ceremony.

@@ -415,4 +415,76 @@ mod tests {
         assert!(payload.get("signals").is_some());
         assert!(payload.get("meta").is_some());
     }
+
+    #[tokio::test]
+    async fn humanitarian_summary_requires_iso_country_code() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/conflict/v1/get-humanitarian-summary")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"countryCode":"usa"}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn acled_endpoint_without_token_returns_empty_events() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/conflict/v1/list-acled-events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["events"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn prediction_endpoint_returns_markets_shape() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/prediction/v1/list-prediction-markets")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("markets").is_some());
+    }
+
+    #[tokio::test]
+    async fn tech_events_endpoint_rejects_negative_days() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/research/v1/list-tech-events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"days":-1}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

@@ -4,7 +4,7 @@ Rust-native server migration target for WorldMonitor API parity.
 
 This crate currently provides:
 - Gateway middleware scaffold (CORS + API-key checks).
-- Phase A + Phase B route coverage for market/intelligence/infrastructure plus economic.
+- Phase A + Phase B route coverage for market/intelligence/infrastructure/economic/conflict/research/prediction.
 - In-memory caching and upstream-backed implementations for shipped routes.
 
 ## Run
@@ -58,6 +58,14 @@ WM_SERVER_ADDR=127.0.0.1:8787 cargo run
 - `POST /api/economic/v1/list-world-bank-indicators`
 - `POST /api/economic/v1/get-energy-prices`
 - `POST /api/economic/v1/get-macro-signals`
+- `POST /api/conflict/v1/list-acled-events`
+- `POST /api/conflict/v1/list-ucdp-events`
+- `POST /api/conflict/v1/get-humanitarian-summary`
+- `POST /api/research/v1/list-arxiv-papers`
+- `POST /api/research/v1/list-trending-repos`
+- `POST /api/research/v1/list-hackernews-items`
+- `POST /api/research/v1/list-tech-events`
+- `POST /api/prediction/v1/list-prediction-markets`
 - `GET /healthz`
 
 See [ROADMAP.md](/data/data/com.termux/files/home/worldmonitor/v3-rust-server/ROADMAP.md) for migration phases and done criteria.

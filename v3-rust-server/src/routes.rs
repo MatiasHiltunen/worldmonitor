@@ -9,7 +9,8 @@ use serde::Serialize;
 use crate::{
     AppState,
     domains::{
-        economic, infrastructure, infrastructure_ops, intelligence, market, seismology, unrest,
+        conflict, economic, infrastructure, infrastructure_ops, intelligence, market, prediction,
+        research, seismology, unrest,
     },
 };
 
@@ -138,6 +139,38 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/economic/v1/get-macro-signals",
             post(economic::get_macro_signals),
+        )
+        .route(
+            "/api/conflict/v1/list-acled-events",
+            post(conflict::list_acled_events),
+        )
+        .route(
+            "/api/conflict/v1/list-ucdp-events",
+            post(conflict::list_ucdp_events),
+        )
+        .route(
+            "/api/conflict/v1/get-humanitarian-summary",
+            post(conflict::get_humanitarian_summary),
+        )
+        .route(
+            "/api/prediction/v1/list-prediction-markets",
+            post(prediction::list_prediction_markets),
+        )
+        .route(
+            "/api/research/v1/list-arxiv-papers",
+            post(research::list_arxiv_papers),
+        )
+        .route(
+            "/api/research/v1/list-trending-repos",
+            post(research::list_trending_repos),
+        )
+        .route(
+            "/api/research/v1/list-hackernews-items",
+            post(research::list_hackernews_items),
+        )
+        .route(
+            "/api/research/v1/list-tech-events",
+            post(research::list_tech_events),
         )
         .fallback(not_found)
         .with_state(state)

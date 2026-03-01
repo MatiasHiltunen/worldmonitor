@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -7,6 +8,7 @@ use std::{
 use axum::{Json, extract::State};
 use chrono::{DateTime, NaiveDate, Utc};
 use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,6 +20,64 @@ const GDELT_GEO_URL: &str = "https://api.gdeltproject.org/api/v2/geo/geo";
 const UNREST_CACHE_TTL: Duration = Duration::from_secs(900);
 const GDELT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const GDELT_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+const RSS_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const RSS_FALLBACK_MAX_EVENTS: usize = 60;
+const RSS_UNREST_FEEDS: [(&str, &str); 4] = [
+    ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("Guardian World", "https://www.theguardian.com/world/rss"),
+    ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+    (
+        "UN News",
+        "https://news.un.org/feed/subscribe/en/news/all/rss.xml",
+    ),
+];
+const RSS_UNREST_KEYWORDS: [&str; 13] = [
+    "protest",
+    "demonstration",
+    "riot",
+    "clash",
+    "strike",
+    "uprising",
+    "unrest",
+    "curfew",
+    "tear gas",
+    "police fired",
+    "civil disobedience",
+    "state of emergency",
+    "anti-government",
+];
+const COUNTRY_KEYWORDS: [(&str, &[&str]); 20] = [
+    (
+        "US",
+        &[
+            "united states",
+            "usa",
+            "america",
+            "washington",
+            "new york",
+            "los angeles",
+        ],
+    ),
+    ("RU", &["russia", "moscow", "kremlin"]),
+    ("CN", &["china", "beijing"]),
+    ("UA", &["ukraine", "kyiv", "kiev"]),
+    ("IR", &["iran", "tehran"]),
+    ("IL", &["israel", "tel aviv", "jerusalem", "gaza"]),
+    ("TW", &["taiwan", "taipei"]),
+    ("KP", &["north korea", "pyongyang"]),
+    ("SA", &["saudi arabia", "riyadh"]),
+    ("TR", &["turkey", "ankara", "istanbul"]),
+    ("PL", &["poland", "warsaw"]),
+    ("DE", &["germany", "berlin"]),
+    ("FR", &["france", "paris"]),
+    ("GB", &["united kingdom", "britain", "uk", "london"]),
+    ("IN", &["india", "new delhi", "delhi"]),
+    ("PK", &["pakistan", "islamabad"]),
+    ("SY", &["syria", "damascus"]),
+    ("YE", &["yemen", "sanaa"]),
+    ("MM", &["myanmar", "burma"]),
+    ("VE", &["venezuela", "caracas"]),
+];
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +191,8 @@ struct CacheEntry {
 static UNREST_CACHE: Lazy<Mutex<HashMap<String, CacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static GDELT_FAILURE_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
+static RSS_ITEM_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)<item>(.*?)</item>").expect("valid rss item regex"));
 
 fn gdelt_cooldown_active() -> bool {
     let Ok(lock) = GDELT_FAILURE_UNTIL.lock() else {
@@ -186,6 +248,133 @@ fn value_string(value: Option<&Value>) -> String {
         .and_then(Value::as_str)
         .map(|text| text.trim().to_string())
         .unwrap_or_default()
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    value
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn strip_cdata(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|value| value.strip_suffix("]]>"))
+        .unwrap_or(trimmed)
+}
+
+fn between(value: &str, start: &str, end: &str) -> Option<String> {
+    let from = value.find(start)? + start.len();
+    let to = value[from..].find(end)? + from;
+    Some(value[from..to].to_string())
+}
+
+fn extract_rss_tag(item: &str, tag: &str) -> Option<String> {
+    let cdata_start = format!("<{tag}><![CDATA[");
+    let cdata_end = format!("]]></{tag}>");
+    if let Some(value) = between(item, &cdata_start, &cdata_end) {
+        return Some(value);
+    }
+
+    between(item, &format!("<{tag}>"), &format!("</{tag}>"))
+}
+
+fn trim_to_char_limit(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect::<String>()
+}
+
+fn parse_rss_published_ms(value: &str) -> i64 {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return now_epoch_ms();
+    }
+
+    DateTime::parse_from_rfc2822(trimmed)
+        .or_else(|_| DateTime::parse_from_rfc3339(trimmed))
+        .map(|date| date.timestamp_millis())
+        .unwrap_or_else(|_| now_epoch_ms())
+}
+
+fn unrest_keyword_hit(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    RSS_UNREST_KEYWORDS
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+}
+
+fn detect_country_code(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    COUNTRY_KEYWORDS.iter().find_map(|(code, keywords)| {
+        keywords
+            .iter()
+            .any(|keyword| lower.contains(keyword))
+            .then_some(*code)
+    })
+}
+
+fn classify_rss_severity(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("riot")
+        || lower.contains("clash")
+        || lower.contains("dead")
+        || lower.contains("killed")
+        || lower.contains("state of emergency")
+    {
+        "SEVERITY_LEVEL_HIGH".to_string()
+    } else if lower.contains("protest")
+        || lower.contains("strike")
+        || lower.contains("demonstration")
+        || lower.contains("unrest")
+    {
+        "SEVERITY_LEVEL_MEDIUM".to_string()
+    } else {
+        "SEVERITY_LEVEL_LOW".to_string()
+    }
+}
+
+fn classify_rss_event_type(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("riot") || lower.contains("clash") {
+        "UNREST_EVENT_TYPE_RIOT".to_string()
+    } else if lower.contains("strike") {
+        "UNREST_EVENT_TYPE_STRIKE".to_string()
+    } else if lower.contains("demonstration") {
+        "UNREST_EVENT_TYPE_DEMONSTRATION".to_string()
+    } else if lower.contains("protest") {
+        "UNREST_EVENT_TYPE_PROTEST".to_string()
+    } else {
+        "UNREST_EVENT_TYPE_CIVIL_UNREST".to_string()
+    }
+}
+
+fn country_filter_matches(filter: &str, country_code: &str, haystack: &str) -> bool {
+    let normalized_filter = filter.trim().to_ascii_lowercase();
+    if normalized_filter.is_empty() {
+        return true;
+    }
+
+    country_code.eq_ignore_ascii_case(filter)
+        || haystack.to_ascii_lowercase().contains(&normalized_filter)
+}
+
+fn rss_event_id(source: &str, title: &str, occurred_at: i64) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    title.hash(&mut hasher);
+    occurred_at.hash(&mut hasher);
+    format!("rss-{:016x}", hasher.finish())
 }
 
 fn parse_date_to_epoch_ms(date: &str) -> i64 {
@@ -285,17 +474,25 @@ fn merge_sources(base: &[String], incoming: &[String]) -> Vec<String> {
 }
 
 fn deduplication_key(event: &UnrestEvent) -> String {
-    let (lat, lon) = event
-        .location
-        .as_ref()
-        .map(|location| (location.latitude, location.longitude))
-        .unwrap_or((0.0, 0.0));
-    let lat_key = (lat * 10.0).round() / 10.0;
-    let lon_key = (lon * 10.0).round() / 10.0;
     let date_key = DateTime::from_timestamp_millis(event.occurred_at)
         .map(|ts| ts.date_naive().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    format!("{lat_key:.1}:{lon_key:.1}:{date_key}")
+
+    if let Some(location) = event.location.as_ref() {
+        let lat_key = (location.latitude * 10.0).round() / 10.0;
+        let lon_key = (location.longitude * 10.0).round() / 10.0;
+        return format!("{lat_key:.1}:{lon_key:.1}:{date_key}");
+    }
+
+    let title_key = event
+        .title
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace())
+        .take(96)
+        .collect::<String>();
+    let country_key = event.country.trim().to_ascii_uppercase();
+    format!("noloc:{country_key}:{date_key}:{title_key}")
 }
 
 fn deduplicate_events(events: Vec<UnrestEvent>) -> Vec<UnrestEvent> {
@@ -655,6 +852,113 @@ async fn fetch_gdelt_events(state: &AppState) -> Vec<UnrestEvent> {
     events
 }
 
+async fn fetch_rss_unrest_events(
+    state: &AppState,
+    request: &ListUnrestEventsRequest,
+) -> Vec<UnrestEvent> {
+    let requested_country = request.country.trim();
+    let mut events = Vec::new();
+
+    for (source_name, url) in RSS_UNREST_FEEDS {
+        let response = match state
+            .http_client
+            .get(url)
+            .header("Accept", "application/xml, text/xml")
+            .header("User-Agent", CHROME_UA)
+            .timeout(RSS_REQUEST_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => response,
+            _ => continue,
+        };
+
+        let xml = match response.text().await {
+            Ok(xml) => xml,
+            Err(_) => continue,
+        };
+
+        for capture in RSS_ITEM_RE.captures_iter(xml.as_str()) {
+            let Some(block) = capture.get(1).map(|entry| entry.as_str()) else {
+                continue;
+            };
+
+            let title = extract_rss_tag(block, "title")
+                .map(|value| normalize_whitespace(&xml_unescape(strip_cdata(value.as_str()))))
+                .unwrap_or_default();
+            if title.is_empty() {
+                continue;
+            }
+
+            let description = extract_rss_tag(block, "description")
+                .map(|value| normalize_whitespace(&xml_unescape(strip_cdata(value.as_str()))))
+                .unwrap_or_default();
+            let haystack = format!("{title} {description}");
+            if !unrest_keyword_hit(haystack.as_str()) {
+                continue;
+            }
+
+            let Some(country_code) = detect_country_code(haystack.as_str()) else {
+                continue;
+            };
+            if !country_filter_matches(requested_country, country_code, haystack.as_str()) {
+                continue;
+            }
+
+            let link = extract_rss_tag(block, "link")
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default();
+            let occurred_at = extract_rss_tag(block, "pubDate")
+                .map(|value| parse_rss_published_ms(value.as_str()))
+                .unwrap_or_else(now_epoch_ms);
+            let severity = classify_rss_severity(haystack.as_str());
+            let event_type = classify_rss_event_type(haystack.as_str());
+            let event_id = rss_event_id(source_name, title.as_str(), occurred_at);
+
+            events.push(UnrestEvent {
+                id: event_id,
+                title: trim_to_char_limit(title.as_str(), 200),
+                summary: trim_to_char_limit(
+                    if description.is_empty() {
+                        title.as_str()
+                    } else {
+                        description.as_str()
+                    },
+                    500,
+                ),
+                event_type,
+                city: String::new(),
+                country: country_code.to_string(),
+                region: String::new(),
+                location: None,
+                occurred_at,
+                severity,
+                fatalities: 0,
+                sources: if link.is_empty() {
+                    vec![source_name.to_string()]
+                } else {
+                    vec![source_name.to_string(), link]
+                },
+                source_type: "UNREST_SOURCE_TYPE_RSS".to_string(),
+                tags: Vec::new(),
+                actors: Vec::new(),
+                confidence: "CONFIDENCE_LEVEL_MEDIUM".to_string(),
+            });
+            if events.len() >= RSS_FALLBACK_MAX_EVENTS {
+                break;
+            }
+        }
+
+        if events.len() >= RSS_FALLBACK_MAX_EVENTS {
+            break;
+        }
+    }
+
+    sort_by_severity_and_recency(&mut events);
+    events.truncate(RSS_FALLBACK_MAX_EVENTS);
+    events
+}
+
 pub async fn list_unrest_events(
     State(state): State<AppState>,
     Json(request): Json<ListUnrestEventsRequest>,
@@ -683,12 +987,15 @@ pub async fn list_unrest_events(
         fetch_gdelt_events(&state)
     );
 
-    let mut events = deduplicate_events(
-        acled_events
-            .into_iter()
-            .chain(gdelt_events.into_iter())
-            .collect::<Vec<_>>(),
-    );
+    let mut merged = acled_events
+        .into_iter()
+        .chain(gdelt_events.into_iter())
+        .collect::<Vec<_>>();
+    if merged.is_empty() {
+        merged.extend(fetch_rss_unrest_events(&state, &request).await);
+    }
+
+    let mut events = deduplicate_events(merged);
 
     if !request.min_severity.trim().is_empty() {
         events.retain(|event| matches_min_severity(event, request.min_severity.as_str()));
@@ -837,5 +1144,46 @@ mod tests {
         };
         assert!(in_bounding_box(&location, Some(&bounding)));
         assert!(in_bounding_box(&location, None::<&BoundingBox>));
+    }
+
+    #[test]
+    fn deduplicate_keeps_distinct_events_without_location() {
+        let mut first = sample_event(
+            "rss-1",
+            "UNREST_SOURCE_TYPE_RSS",
+            "SEVERITY_LEVEL_MEDIUM",
+            1_000,
+            vec!["BBC World"],
+        );
+        first.location = None;
+        first.title = "Protest in Tehran over fuel prices".to_string();
+        first.country = "IR".to_string();
+
+        let mut second = sample_event(
+            "rss-2",
+            "UNREST_SOURCE_TYPE_RSS",
+            "SEVERITY_LEVEL_MEDIUM",
+            1_050,
+            vec!["Guardian World"],
+        );
+        second.location = None;
+        second.title = "Mass strike reported in Paris transport".to_string();
+        second.country = "FR".to_string();
+
+        let deduped = deduplicate_events(vec![first, second]);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn detects_country_code_from_keywords() {
+        assert_eq!(
+            detect_country_code("clashes reported near Kyiv after protest"),
+            Some("UA")
+        );
+        assert_eq!(
+            detect_country_code("demonstration in Tehran turns tense"),
+            Some("IR")
+        );
+        assert_eq!(detect_country_code("unknown location update"), None);
     }
 }

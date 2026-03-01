@@ -277,4 +277,65 @@ mod tests {
         let payload = response_json(response).await;
         assert!(payload.get("classification").is_none());
     }
+
+    #[tokio::test]
+    async fn baseline_endpoint_rejects_invalid_payload() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/infrastructure/v1/get-temporal-baseline")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"type":"","count":0}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(
+            payload["error"],
+            "Missing or invalid params: type and count required"
+        );
+    }
+
+    #[tokio::test]
+    async fn baseline_snapshot_then_read_returns_learning_state() {
+        let app = test_app();
+        let record_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/infrastructure/v1/record-baseline-snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"updates":[{"type":"news","region":"global","count":10}]}"#,
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(record_response.status(), StatusCode::OK);
+        let record_payload = response_json(record_response).await;
+        assert_eq!(record_payload["updated"], 1);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/infrastructure/v1/get-temporal-baseline")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"type":"news","region":"global","count":12}"#,
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_payload = response_json(get_response).await;
+        assert_eq!(get_payload["learning"], true);
+    }
 }

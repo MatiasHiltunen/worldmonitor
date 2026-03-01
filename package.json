@@ -14,6 +14,7 @@
     "build": "tsc && vite build",
     "build:sidecar-sebuf": "node scripts/build-sidecar-sebuf.mjs",
     "build:desktop": "node scripts/build-sidecar-sebuf.mjs && tsc && vite build",
+    "build:roads": "node scripts/build-major-roads.mjs",
     "build:full": "VITE_VARIANT=full tsc && VITE_VARIANT=full vite build",
     "build:tech": "VITE_VARIANT=tech tsc && VITE_VARIANT=tech vite build",
     "build:finance": "VITE_VARIANT=finance tsc && VITE_VARIANT=finance vite build",

@@ -16,6 +16,8 @@ const CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWe
 const ACLED_API_URL: &str = "https://acleddata.com/api/acled/read";
 const GDELT_GEO_URL: &str = "https://api.gdeltproject.org/api/v2/geo/geo";
 const UNREST_CACHE_TTL: Duration = Duration::from_secs(900);
+const GDELT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const GDELT_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +130,27 @@ struct CacheEntry {
 
 static UNREST_CACHE: Lazy<Mutex<HashMap<String, CacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static GDELT_FAILURE_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
+
+fn gdelt_cooldown_active() -> bool {
+    let Ok(lock) = GDELT_FAILURE_UNTIL.lock() else {
+        return false;
+    };
+
+    lock.as_ref().is_some_and(|until| Instant::now() < *until)
+}
+
+fn mark_gdelt_failure_cooldown() {
+    if let Ok(mut lock) = GDELT_FAILURE_UNTIL.lock() {
+        *lock = Some(Instant::now() + GDELT_FAILURE_COOLDOWN);
+    }
+}
+
+fn clear_gdelt_failure_cooldown() {
+    if let Ok(mut lock) = GDELT_FAILURE_UNTIL.lock() {
+        *lock = None;
+    }
+}
 
 fn now_epoch_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -502,23 +525,40 @@ async fn fetch_acled_protests(
 }
 
 async fn fetch_gdelt_events(state: &AppState) -> Vec<UnrestEvent> {
+    if gdelt_cooldown_active() {
+        return Vec::new();
+    }
+
     let query = "query=protest&format=geojson&maxrecords=250&timespan=7d";
     let response = match state
         .http_client
         .get(format!("{}?{}", GDELT_GEO_URL, query))
         .header("Accept", "application/json")
         .header("User-Agent", CHROME_UA)
+        .timeout(GDELT_REQUEST_TIMEOUT)
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => response,
-        _ => return Vec::new(),
+        Ok(response) => response,
+        Err(_) => {
+            mark_gdelt_failure_cooldown();
+            return Vec::new();
+        }
     };
+
+    if !response.status().is_success() {
+        mark_gdelt_failure_cooldown();
+        return Vec::new();
+    }
 
     let payload = match response.json::<Value>().await {
         Ok(payload) => payload,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            mark_gdelt_failure_cooldown();
+            return Vec::new();
+        }
     };
+    clear_gdelt_failure_cooldown();
 
     let features = payload
         .get("features")

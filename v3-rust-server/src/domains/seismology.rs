@@ -262,3 +262,45 @@ pub async fn list_earthquakes(
         }),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_range_filtering_works() {
+        let range = TimeRange {
+            start: 100,
+            end: 200,
+        };
+        assert!(within_time_range(100, Some(&range)));
+        assert!(within_time_range(150, Some(&range)));
+        assert!(within_time_range(200, Some(&range)));
+        assert!(!within_time_range(99, Some(&range)));
+        assert!(!within_time_range(201, Some(&range)));
+    }
+
+    #[test]
+    fn page_size_clamps_to_expected_limits() {
+        let default_request = ListEarthquakesRequest::default();
+        assert_eq!(page_size(&default_request), 500);
+
+        let bounded = ListEarthquakesRequest {
+            pagination: Some(PaginationRequest {
+                page_size: 5,
+                cursor: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(page_size(&bounded), 5);
+
+        let capped = ListEarthquakesRequest {
+            pagination: Some(PaginationRequest {
+                page_size: 2_500,
+                cursor: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(page_size(&capped), 1_000);
+    }
+}

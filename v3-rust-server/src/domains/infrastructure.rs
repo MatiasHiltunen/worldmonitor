@@ -939,3 +939,43 @@ pub async fn list_service_statuses(
 
     Ok(Json(ListServiceStatusesResponse { statuses: filtered }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_status_strings() {
+        assert_eq!(
+            normalize_to_proto_status("operational"),
+            "SERVICE_OPERATIONAL_STATUS_OPERATIONAL"
+        );
+        assert_eq!(
+            normalize_to_proto_status("major_outage"),
+            "SERVICE_OPERATIONAL_STATUS_MAJOR_OUTAGE"
+        );
+        assert_eq!(
+            normalize_to_proto_status("maintenance"),
+            "SERVICE_OPERATIONAL_STATUS_MAINTENANCE"
+        );
+    }
+
+    #[test]
+    fn orders_status_by_urgency() {
+        assert!(
+            status_order("SERVICE_OPERATIONAL_STATUS_MAJOR_OUTAGE")
+                < status_order("SERVICE_OPERATIONAL_STATUS_DEGRADED")
+        );
+        assert!(
+            status_order("SERVICE_OPERATIONAL_STATUS_DEGRADED")
+                < status_order("SERVICE_OPERATIONAL_STATUS_OPERATIONAL")
+        );
+    }
+
+    #[test]
+    fn detects_html_response_shape() {
+        assert!(is_html("<!doctype html><html>"));
+        assert!(is_html("<html><body></body></html>"));
+        assert!(!is_html("{\"status\": \"ok\"}"));
+    }
+}

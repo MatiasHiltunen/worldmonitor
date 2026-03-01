@@ -58,6 +58,26 @@ pub fn build_router(state: AppState) -> Router {
             post(market::get_country_stock_index),
         )
         .route(
+            "/api/market/v1/list-market-quotes",
+            post(market::list_market_quotes),
+        )
+        .route(
+            "/api/market/v1/list-commodity-quotes",
+            post(market::list_commodity_quotes),
+        )
+        .route(
+            "/api/market/v1/get-sector-summary",
+            post(market::get_sector_summary),
+        )
+        .route(
+            "/api/market/v1/list-stablecoin-markets",
+            post(market::list_stablecoin_markets),
+        )
+        .route(
+            "/api/market/v1/list-etf-flows",
+            post(market::list_etf_flows),
+        )
+        .route(
             "/api/seismology/v1/list-earthquakes",
             post(seismology::list_earthquakes),
         )

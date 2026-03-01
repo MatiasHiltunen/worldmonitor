@@ -678,3 +678,124 @@ pub async fn list_unrest_events(
 
     Ok(Json(response))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event(
+        id: &str,
+        source_type: &str,
+        severity: &str,
+        occurred_at: i64,
+        sources: Vec<&str>,
+    ) -> UnrestEvent {
+        UnrestEvent {
+            id: id.to_string(),
+            title: "Event".to_string(),
+            summary: String::new(),
+            event_type: "UNREST_EVENT_TYPE_PROTEST".to_string(),
+            city: "City".to_string(),
+            country: "Country".to_string(),
+            region: "Region".to_string(),
+            location: Some(GeoCoordinates {
+                latitude: 10.1,
+                longitude: 20.1,
+            }),
+            occurred_at,
+            severity: severity.to_string(),
+            fatalities: 0,
+            sources: sources.into_iter().map(ToString::to_string).collect(),
+            source_type: source_type.to_string(),
+            tags: Vec::new(),
+            actors: Vec::new(),
+            confidence: "CONFIDENCE_LEVEL_MEDIUM".to_string(),
+        }
+    }
+
+    #[test]
+    fn maps_event_types() {
+        assert_eq!(
+            map_acled_event_type("Riots", ""),
+            "UNREST_EVENT_TYPE_RIOT".to_string()
+        );
+        assert_eq!(
+            map_acled_event_type("Protests", ""),
+            "UNREST_EVENT_TYPE_PROTEST".to_string()
+        );
+    }
+
+    #[test]
+    fn deduplicate_prefers_acled_source() {
+        let gdelt = sample_event(
+            "gdelt-1",
+            "UNREST_SOURCE_TYPE_GDELT",
+            "SEVERITY_LEVEL_LOW",
+            1_000,
+            vec!["GDELT"],
+        );
+        let acled = sample_event(
+            "acled-1",
+            "UNREST_SOURCE_TYPE_ACLED",
+            "SEVERITY_LEVEL_HIGH",
+            1_200,
+            vec!["ACLED"],
+        );
+        let deduped = deduplicate_events(vec![gdelt, acled.clone()]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].source_type, "UNREST_SOURCE_TYPE_ACLED");
+        assert!(deduped[0].sources.iter().any(|source| source == "GDELT"));
+        assert!(deduped[0].sources.iter().any(|source| source == "ACLED"));
+    }
+
+    #[test]
+    fn sorts_by_severity_then_recency() {
+        let mut events = vec![
+            sample_event(
+                "a",
+                "UNREST_SOURCE_TYPE_GDELT",
+                "SEVERITY_LEVEL_LOW",
+                100,
+                vec!["one"],
+            ),
+            sample_event(
+                "b",
+                "UNREST_SOURCE_TYPE_GDELT",
+                "SEVERITY_LEVEL_HIGH",
+                50,
+                vec!["two"],
+            ),
+            sample_event(
+                "c",
+                "UNREST_SOURCE_TYPE_GDELT",
+                "SEVERITY_LEVEL_HIGH",
+                200,
+                vec!["three"],
+            ),
+        ];
+        sort_by_severity_and_recency(&mut events);
+        assert_eq!(events[0].id, "c");
+        assert_eq!(events[1].id, "b");
+        assert_eq!(events[2].id, "a");
+    }
+
+    #[test]
+    fn bounding_box_filter_checks_coordinates() {
+        let location = Some(GeoCoordinates {
+            latitude: 40.0,
+            longitude: -70.0,
+        });
+        let bounding = BoundingBox {
+            north_east: GeoCoordinates {
+                latitude: 45.0,
+                longitude: -60.0,
+            },
+            south_west: GeoCoordinates {
+                latitude: 35.0,
+                longitude: -80.0,
+            },
+        };
+        assert!(in_bounding_box(&location, Some(&bounding)));
+        assert!(in_bounding_box(&location, None::<&BoundingBox>));
+    }
+}

@@ -619,3 +619,43 @@ pub async fn get_risk_scores(
 
     Ok(Json(response))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_iso_country_code() {
+        assert!(is_valid_country_code("US"));
+        assert!(is_valid_country_code("de"));
+        assert!(!is_valid_country_code("USA"));
+        assert!(!is_valid_country_code("U1"));
+    }
+
+    #[test]
+    fn normalizes_country_keywords() {
+        assert_eq!(normalize_country_name("Riot in Washington"), Some("US"));
+        assert_eq!(normalize_country_name("Moscow update"), Some("RU"));
+        assert_eq!(normalize_country_name("Unknown place"), None);
+    }
+
+    #[test]
+    fn computes_scores_for_tier1_set() {
+        let scores = compute_cii_scores(&[]);
+        assert_eq!(scores.len(), TIER1_COUNTRIES.len());
+        assert!(
+            scores
+                .windows(2)
+                .all(|pair| { pair[0].combined_score >= pair[1].combined_score })
+        );
+    }
+
+    #[test]
+    fn strategic_risk_uses_global_region() {
+        let scores = compute_cii_scores(&[]);
+        let risks = compute_strategic_risks(&scores);
+        assert_eq!(risks.len(), 1);
+        assert_eq!(risks[0].region, "global");
+        assert!(risks[0].score >= 0.0 && risks[0].score <= 100.0);
+    }
+}

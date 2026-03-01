@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub runtime_env: String,
     pub groq_api_key: Option<String>,
     pub acled_access_token: Option<String>,
+    pub finnhub_api_key: Option<String>,
     pub request_timeout_ms: u64,
 }
 
@@ -37,6 +38,9 @@ impl AppConfig {
         let acled_access_token = env::var("ACLED_ACCESS_TOKEN")
             .ok()
             .filter(|value| !value.is_empty());
+        let finnhub_api_key = env::var("FINNHUB_API_KEY")
+            .ok()
+            .filter(|value| !value.is_empty());
 
         let request_timeout_ms = env::var("WM_UPSTREAM_TIMEOUT_MS")
             .ok()
@@ -49,6 +53,7 @@ impl AppConfig {
             runtime_env,
             groq_api_key,
             acled_access_token,
+            finnhub_api_key,
             request_timeout_ms,
         })
     }

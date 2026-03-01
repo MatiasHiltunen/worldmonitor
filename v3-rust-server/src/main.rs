@@ -1,25 +1,7 @@
-use std::sync::Arc;
-
 use anyhow::Result;
-use axum::middleware;
-use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
-
-mod cache;
-mod config;
-mod domains;
-mod error;
-mod http;
-mod routes;
-
-use crate::config::AppConfig;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<AppConfig>,
-    pub http_client: reqwest::Client,
-}
+use v3_rust_server::{AppState, build_app, config::AppConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,24 +12,8 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(config.request_timeout_ms))
-        .build()?;
-    let state = AppState {
-        config: Arc::new(config.clone()),
-        http_client,
-    };
-
-    let app = routes::build_router(state.clone())
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            http::auth::enforce_api_key,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            http::cors::enforce_cors,
-        ))
-        .layer(TraceLayer::new_for_http());
+    let state = AppState::from_config(config.clone())?;
+    let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     info!("worldmonitor rust server listening on {}", config.bind_addr);
@@ -57,19 +23,15 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
-        middleware,
         response::Response,
     };
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use super::*;
+    use v3_rust_server::{AppState, build_app, config::AppConfig};
 
     fn test_state() -> AppState {
         let config = AppConfig {
@@ -83,27 +45,11 @@ mod tests {
             eia_api_key: None,
             request_timeout_ms: 500,
         };
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(config.request_timeout_ms))
-            .build()
-            .expect("build test http client");
-        AppState {
-            config: Arc::new(config),
-            http_client,
-        }
+        AppState::from_config(config).expect("build test app state")
     }
 
     fn test_app() -> axum::Router {
-        let state = test_state();
-        routes::build_router(state.clone())
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                http::auth::enforce_api_key,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                http::cors::enforce_cors,
-            ))
+        build_app(test_state())
     }
 
     async fn response_json(response: Response) -> Value {

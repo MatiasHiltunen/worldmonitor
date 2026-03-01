@@ -4,16 +4,17 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use feed_rs::parser;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -27,6 +28,10 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use strum::{Display, EnumIter, IntoEnumIterator};
+use v3_rust_server::{
+    config::AppConfig as ServerAppConfig,
+    in_process::{InProcessClient, InProcessClientError},
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,10 +44,19 @@ struct Cli {
     base_url: String,
     #[arg(long, env = "WORLDMONITOR_API_KEY")]
     api_key: Option<String>,
+    #[arg(long, env = "WM_API_MODE", value_enum, default_value_t = ApiMode::Library)]
+    api_mode: ApiMode,
     #[arg(long, default_value_t = 15)]
     timeout_secs: u64,
     #[arg(long, default_value_t = 0)]
     auto_refresh_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum ApiMode {
+    Library,
+    Http,
+    Auto,
 }
 
 #[derive(Clone, Copy, Debug, Display, EnumIter, PartialEq, Eq, Hash)]
@@ -105,28 +119,438 @@ impl Endpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppView {
+    Api,
+    Rss,
+    Brief,
+}
+
+impl AppView {
+    fn next(self) -> Self {
+        match self {
+            AppView::Api => AppView::Rss,
+            AppView::Rss => AppView::Brief,
+            AppView::Brief => AppView::Api,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Display, EnumIter, PartialEq, Eq, Hash)]
+enum FeedVariant {
+    #[strum(to_string = "WORLD")]
+    World,
+    #[strum(to_string = "TECH")]
+    Tech,
+    #[strum(to_string = "FINANCE")]
+    Finance,
+}
+
+impl FeedVariant {
+    fn next(self) -> Self {
+        match self {
+            FeedVariant::World => FeedVariant::Tech,
+            FeedVariant::Tech => FeedVariant::Finance,
+            FeedVariant::Finance => FeedVariant::World,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FeedSource {
+    id: &'static str,
+    name: &'static str,
+    url: &'static str,
+    category: &'static str,
+}
+
+const WORLD_FEEDS: &[FeedSource] = &[
+    FeedSource {
+        id: "bbc-world",
+        name: "BBC World",
+        url: "https://feeds.bbci.co.uk/news/world/rss.xml",
+        category: "Geopolitics",
+    },
+    FeedSource {
+        id: "guardian-world",
+        name: "Guardian World",
+        url: "https://www.theguardian.com/world/rss",
+        category: "Geopolitics",
+    },
+    FeedSource {
+        id: "aljazeera-all",
+        name: "Al Jazeera",
+        url: "https://www.aljazeera.com/xml/rss/all.xml",
+        category: "Conflict",
+    },
+    FeedSource {
+        id: "un-news",
+        name: "UN News",
+        url: "https://news.un.org/feed/subscribe/en/news/all/rss.xml",
+        category: "Humanitarian",
+    },
+    FeedSource {
+        id: "npr-world",
+        name: "NPR World",
+        url: "https://feeds.npr.org/1004/rss.xml",
+        category: "Geopolitics",
+    },
+];
+
+const TECH_FEEDS: &[FeedSource] = &[
+    FeedSource {
+        id: "hn-frontpage",
+        name: "Hacker News",
+        url: "https://hnrss.org/frontpage",
+        category: "Startups",
+    },
+    FeedSource {
+        id: "techcrunch",
+        name: "TechCrunch",
+        url: "https://techcrunch.com/feed/",
+        category: "Startups",
+    },
+    FeedSource {
+        id: "the-verge",
+        name: "The Verge",
+        url: "https://www.theverge.com/rss/index.xml",
+        category: "AI/Tech",
+    },
+    FeedSource {
+        id: "ars",
+        name: "Ars Technica",
+        url: "https://feeds.arstechnica.com/arstechnica/index",
+        category: "AI/Tech",
+    },
+    FeedSource {
+        id: "github-blog",
+        name: "GitHub Blog",
+        url: "https://github.blog/feed/",
+        category: "Developer",
+    },
+];
+
+const FINANCE_FEEDS: &[FeedSource] = &[
+    FeedSource {
+        id: "marketwatch",
+        name: "MarketWatch",
+        url: "https://feeds.marketwatch.com/marketwatch/topstories/",
+        category: "Markets",
+    },
+    FeedSource {
+        id: "cnbc-markets",
+        name: "CNBC Markets",
+        url: "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        category: "Markets",
+    },
+    FeedSource {
+        id: "coindesk",
+        name: "CoinDesk",
+        url: "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        category: "Crypto",
+    },
+    FeedSource {
+        id: "investing",
+        name: "Investing.com",
+        url: "https://www.investing.com/rss/news_25.rss",
+        category: "Macro",
+    },
+    FeedSource {
+        id: "ft-world-economy",
+        name: "FT Economy",
+        url: "https://www.ft.com/world?format=rss",
+        category: "Macro",
+    },
+];
+
+const BRIEF_COUNTRIES: &[(&str, &str)] = &[
+    ("US", "United States"),
+    ("RU", "Russia"),
+    ("CN", "China"),
+    ("UA", "Ukraine"),
+    ("IR", "Iran"),
+    ("IL", "Israel"),
+    ("TW", "Taiwan"),
+    ("KP", "North Korea"),
+    ("SA", "Saudi Arabia"),
+    ("TR", "Turkey"),
+    ("PL", "Poland"),
+    ("DE", "Germany"),
+    ("FR", "France"),
+    ("GB", "United Kingdom"),
+    ("IN", "India"),
+    ("PK", "Pakistan"),
+    ("SY", "Syria"),
+    ("YE", "Yemen"),
+    ("MM", "Myanmar"),
+    ("VE", "Venezuela"),
+];
+
+fn feed_sources_for_variant(variant: FeedVariant) -> &'static [FeedSource] {
+    match variant {
+        FeedVariant::World => WORLD_FEEDS,
+        FeedVariant::Tech => TECH_FEEDS,
+        FeedVariant::Finance => FINANCE_FEEDS,
+    }
+}
+
+fn country_name_from_code(code: &str) -> String {
+    BRIEF_COUNTRIES
+        .iter()
+        .find(|(country_code, _)| country_code.eq_ignore_ascii_case(code))
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| code.to_string())
+}
+
+fn brief_country_aliases(code: &str) -> &'static [&'static str] {
+    match code {
+        "US" => &["united states", "usa", "washington", "america"],
+        "RU" => &["russia", "moscow", "kremlin"],
+        "CN" => &["china", "beijing"],
+        "UA" => &["ukraine", "kyiv"],
+        "IR" => &["iran", "tehran"],
+        "IL" => &["israel", "jerusalem", "tel aviv"],
+        "TW" => &["taiwan", "taipei"],
+        "KP" => &["north korea", "pyongyang"],
+        "SA" => &["saudi arabia", "riyadh"],
+        "TR" => &["turkey", "ankara"],
+        "PL" => &["poland", "warsaw"],
+        "DE" => &["germany", "berlin"],
+        "FR" => &["france", "paris"],
+        "GB" => &["united kingdom", "britain", "london"],
+        "IN" => &["india", "new delhi"],
+        "PK" => &["pakistan", "islamabad"],
+        "SY" => &["syria", "damascus"],
+        "YE" => &["yemen", "sanaa"],
+        "MM" => &["myanmar", "burma"],
+        "VE" => &["venezuela", "caracas"],
+        _ => &[],
+    }
+}
+
+fn is_valid_country_code(input: &str) -> bool {
+    input.len() == 2 && input.chars().all(|ch| ch.is_ascii_alphabetic())
+}
+
+#[derive(Clone, Debug)]
+struct FeedHealth {
+    consecutive_failures: u8,
+    cooldown_until: Option<Instant>,
+    last_error: Option<String>,
+    last_success: Option<Instant>,
+}
+
+impl Default for FeedHealth {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            cooldown_until: None,
+            last_error: None,
+            last_success: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RssItem {
+    id: String,
+    title: String,
+    summary: String,
+    link: String,
+    source_name: String,
+    category: String,
+    published_ts_ms: i64,
+    keyword_hits: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RssFetchResult {
+    items: Vec<RssItem>,
+    updated_health: HashMap<String, FeedHealth>,
+    fetched_feeds: usize,
+    skipped_cooldown: usize,
+    failed_feeds: usize,
+    duration_ms: u128,
+    keyword_counts: HashMap<String, usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RssInputMode {
+    None,
+    Search,
+    Keywords,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BriefInputMode {
+    None,
+    CountryCode,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BriefSnapshot {
+    country_code: String,
+    country_name: String,
+    intel_brief: String,
+    intel_model: String,
+    intel_generated_at: i64,
+    cii_score: Option<f64>,
+    cii_trend: String,
+    strategic_level: String,
+    stock_available: bool,
+    stock_index_name: String,
+    stock_price: f64,
+    stock_week_change: f64,
+    stock_currency: String,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CountryIntelBriefResponse {
+    #[serde(default)]
+    country_code: String,
+    #[serde(default)]
+    country_name: String,
+    #[serde(default)]
+    brief: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    generated_at: i64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RiskScoresResponse {
+    #[serde(default)]
+    cii_scores: Vec<CiiScore>,
+    #[serde(default)]
+    strategic_risks: Vec<StrategicRisk>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CiiScore {
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    combined_score: f64,
+    #[serde(default)]
+    trend: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StrategicRisk {
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    level: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CountryStockIndexResponse {
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    index_name: String,
+    #[serde(default)]
+    price: f64,
+    #[serde(default)]
+    week_change_percent: f64,
+    #[serde(default)]
+    currency: String,
+}
+
 #[derive(Clone)]
 struct ApiClient {
     base_url: String,
     api_key: Option<String>,
     client: Client,
+    transport: ApiTransport,
+}
+
+#[derive(Clone)]
+enum ApiTransport {
+    Http,
+    Library(InProcessClient),
 }
 
 impl ApiClient {
-    fn new(base_url: String, api_key: Option<String>, timeout_secs: u64) -> Result<Self> {
+    fn new(
+        base_url: String,
+        api_key: Option<String>,
+        timeout_secs: u64,
+        api_mode: ApiMode,
+    ) -> Result<Self> {
+        let normalized_base_url = base_url.trim_end_matches('/').to_string();
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
             .context("failed to build HTTP client")?;
+
+        let transport = match api_mode {
+            ApiMode::Http => ApiTransport::Http,
+            ApiMode::Library => {
+                ApiTransport::Library(Self::build_library_client(api_key.clone(), timeout_secs)?)
+            }
+            ApiMode::Auto => {
+                if looks_like_local_base_url(&normalized_base_url) {
+                    ApiTransport::Library(Self::build_library_client(
+                        api_key.clone(),
+                        timeout_secs,
+                    )?)
+                } else {
+                    ApiTransport::Http
+                }
+            }
+        };
+
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: normalized_base_url,
             api_key,
             client,
+            transport,
         })
     }
 
-    fn fetch_json(&self, endpoint: Endpoint, request_body: &Value) -> Result<Value> {
-        let url = format!("{}{}", self.base_url, endpoint.path());
+    fn build_library_client(api_key: Option<String>, timeout_secs: u64) -> Result<InProcessClient> {
+        let fallback_config = ServerAppConfig {
+            bind_addr: "127.0.0.1:3000"
+                .parse()
+                .expect("valid default bind address"),
+            valid_keys: Vec::new(),
+            runtime_env: "development".to_string(),
+            groq_api_key: None,
+            acled_access_token: None,
+            finnhub_api_key: None,
+            fred_api_key: None,
+            eia_api_key: None,
+            request_timeout_ms: timeout_secs.saturating_mul(1000),
+        };
+
+        let mut server_config = ServerAppConfig::from_env().unwrap_or(fallback_config);
+        server_config.request_timeout_ms = timeout_secs.saturating_mul(1000);
+        if server_config.valid_keys.is_empty()
+            && let Some(key) = api_key.as_ref()
+        {
+            server_config.valid_keys.push(key.clone());
+        }
+
+        let mut local = InProcessClient::from_config(server_config)
+            .context("failed to initialize in-process rust-server client")?;
+        if let Some(key) = api_key {
+            local = local.with_default_api_key(Some(key));
+        }
+        Ok(local)
+    }
+
+    fn post_json_path_http(&self, path: &str, request_body: &Value) -> Result<Value> {
+        let url = format!("{}{}", self.base_url, path);
         let mut request = self
             .client
             .post(&url)
@@ -139,7 +563,7 @@ impl ApiClient {
         let response = request
             .json(request_body)
             .send()
-            .with_context(|| format!("request failed: {}", endpoint.path()))?;
+            .with_context(|| format!("request failed: {url}"))?;
 
         let status = response.status();
         let body_text = response
@@ -150,7 +574,7 @@ impl ApiClient {
             return Err(anyhow!(
                 "HTTP {} from {}: {}",
                 status.as_u16(),
-                endpoint.path(),
+                path,
                 truncate_for_error(&body_text, 180)
             ));
         }
@@ -159,9 +583,76 @@ impl ApiClient {
             serde_json::from_str(&body_text).context("response was not valid JSON")?;
         Ok(payload)
     }
+
+    fn post_json_path_library(&self, path: &str, request_body: &Value) -> Result<Value> {
+        let ApiTransport::Library(local) = &self.transport else {
+            return Err(anyhow!("library transport unavailable"));
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build tokio runtime for in-process call")?;
+
+        runtime
+            .block_on(local.post_json_path(path, request_body))
+            .map_err(|error| match error {
+                InProcessClientError::HttpStatus { status, path, body } => anyhow!(
+                    "HTTP {} from {}: {}",
+                    status.as_u16(),
+                    path,
+                    truncate_for_error(&body, 180)
+                ),
+                other => anyhow!("in-process call failed for {}: {}", path, other),
+            })
+    }
+
+    fn post_json_path(&self, path: &str, request_body: &Value) -> Result<Value> {
+        match &self.transport {
+            ApiTransport::Http => self.post_json_path_http(path, request_body),
+            ApiTransport::Library(_) => self.post_json_path_library(path, request_body),
+        }
+    }
+
+    fn fetch_json(&self, endpoint: Endpoint, request_body: &Value) -> Result<Value> {
+        self.post_json_path(endpoint.path(), request_body)
+    }
+
+    fn get_country_intel_brief(&self, country_code: &str) -> Result<CountryIntelBriefResponse> {
+        let payload = self.post_json_path(
+            "/api/intelligence/v1/get-country-intel-brief",
+            &json!({ "countryCode": country_code }),
+        )?;
+        serde_json::from_value(payload).context("failed to decode intelligence brief response")
+    }
+
+    fn get_risk_scores(&self, region: &str) -> Result<RiskScoresResponse> {
+        let payload = self.post_json_path(
+            "/api/intelligence/v1/get-risk-scores",
+            &json!({ "region": region }),
+        )?;
+        serde_json::from_value(payload).context("failed to decode risk scores response")
+    }
+
+    fn get_country_stock_index(&self, country_code: &str) -> Result<CountryStockIndexResponse> {
+        let payload = self.post_json_path(
+            "/api/market/v1/get-country-stock-index",
+            &json!({ "countryCode": country_code }),
+        )?;
+        serde_json::from_value(payload).context("failed to decode country stock index response")
+    }
+}
+
+fn looks_like_local_base_url(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1:")
+        || lower.starts_with("http://localhost:")
+        || lower == "http://127.0.0.1"
+        || lower == "http://localhost"
 }
 
 struct App {
+    view: AppView,
     endpoints: Vec<Endpoint>,
     selected: usize,
     output_lines: Vec<String>,
@@ -176,6 +667,36 @@ struct App {
     auto_refresh_enabled: bool,
     refresh_interval: Option<Duration>,
     last_fetch_finished_at: Option<Instant>,
+    rss_variant: FeedVariant,
+    rss_items: Vec<RssItem>,
+    rss_view_items: Vec<RssItem>,
+    rss_selected: usize,
+    rss_detail_scroll: u16,
+    rss_query: String,
+    rss_keywords: Vec<String>,
+    rss_categories: Vec<String>,
+    rss_category_index: usize,
+    rss_search_editor: TextArea<'static>,
+    rss_keywords_editor: TextArea<'static>,
+    rss_input_mode: RssInputMode,
+    rss_in_flight: bool,
+    rss_last_fetch_finished_at: Option<Instant>,
+    rss_feed_health: HashMap<String, FeedHealth>,
+    rss_keyword_baseline: HashMap<String, f64>,
+    rss_spikes: Vec<String>,
+    rss_last_fetch_summary: String,
+    brief_country_code: String,
+    brief_country_index: usize,
+    brief_country_editor: TextArea<'static>,
+    brief_input_mode: BriefInputMode,
+    brief_in_flight: bool,
+    brief_last_fetch_finished_at: Option<Instant>,
+    brief_last_fetch_summary: String,
+    brief_snapshot: Option<BriefSnapshot>,
+    brief_related_rss: Vec<RssItem>,
+    brief_related_selected: usize,
+    brief_brief_scroll: u16,
+    brief_news_scroll: u16,
 }
 
 impl App {
@@ -187,6 +708,19 @@ impl App {
         let (template_bodies, request_bodies, template_source, loaded_from_docs) =
             build_initial_request_bodies(&endpoints);
 
+        let rss_variant = FeedVariant::World;
+        let rss_categories = categories_for_variant(rss_variant);
+        let rss_search_editor = build_single_line_editor("Search RSS (Enter apply, Esc cancel)");
+        let rss_keywords_editor =
+            build_single_line_editor("Keywords (comma-separated, Enter apply, Esc cancel)");
+        let brief_country_code = BRIEF_COUNTRIES
+            .first()
+            .map(|(code, _)| (*code).to_string())
+            .unwrap_or_else(|| "US".to_string());
+        let mut brief_country_editor =
+            build_single_line_editor("Country code (ISO-2, Enter apply, Esc cancel)");
+        brief_country_editor.insert_str(brief_country_code.clone());
+
         let request_editor = build_request_editor(
             request_bodies
                 .get(&selected_endpoint)
@@ -197,6 +731,7 @@ impl App {
         );
 
         Self {
+            view: AppView::Api,
             endpoints,
             selected,
             output_lines: vec![
@@ -205,6 +740,7 @@ impl App {
                 template_source,
                 String::new(),
                 "Use Up/Down to choose endpoint, Enter/r to fetch.".to_string(),
+                "Press Tab to switch API/RSS/BRIEF workspaces.".to_string(),
                 "Press e to edit request JSON, a to toggle auto-refresh.".to_string(),
                 "Press t to reset current request body to template.".to_string(),
                 "Use j/k to scroll response, q or Esc to quit.".to_string(),
@@ -224,6 +760,41 @@ impl App {
             auto_refresh_enabled: refresh_interval.is_some(),
             refresh_interval,
             last_fetch_finished_at: None,
+            rss_variant,
+            rss_items: Vec::new(),
+            rss_view_items: Vec::new(),
+            rss_selected: 0,
+            rss_detail_scroll: 0,
+            rss_query: String::new(),
+            rss_keywords: vec![
+                "conflict".to_string(),
+                "cyber".to_string(),
+                "earthquake".to_string(),
+                "sanction".to_string(),
+            ],
+            rss_categories,
+            rss_category_index: 0,
+            rss_search_editor,
+            rss_keywords_editor,
+            rss_input_mode: RssInputMode::None,
+            rss_in_flight: false,
+            rss_last_fetch_finished_at: None,
+            rss_feed_health: HashMap::new(),
+            rss_keyword_baseline: HashMap::new(),
+            rss_spikes: Vec::new(),
+            rss_last_fetch_summary: "RSS not fetched yet".to_string(),
+            brief_country_code,
+            brief_country_index: 0,
+            brief_country_editor,
+            brief_input_mode: BriefInputMode::None,
+            brief_in_flight: false,
+            brief_last_fetch_finished_at: None,
+            brief_last_fetch_summary: "Country brief not fetched yet".to_string(),
+            brief_snapshot: None,
+            brief_related_rss: Vec::new(),
+            brief_related_selected: 0,
+            brief_brief_scroll: 0,
+            brief_news_scroll: 0,
         }
     }
 
@@ -334,6 +905,22 @@ impl App {
             .with_context(|| format!("saved request body for {} is invalid JSON", endpoint))
     }
 
+    fn toggle_view(&mut self) {
+        self.view = self.view.next();
+        match self.view {
+            AppView::Api => {
+                self.status_line = "Switched to API workspace".to_string();
+                self.ensure_editor_synced();
+            }
+            AppView::Rss => {
+                self.status_line = "Switched to RSS workspace".to_string();
+            }
+            AppView::Brief => {
+                self.status_line = "Switched to BRIEF workspace".to_string();
+            }
+        }
+    }
+
     fn toggle_auto_refresh(&mut self) {
         if self.refresh_interval.is_none() {
             self.status_line = "Auto-refresh unavailable; set --auto-refresh-secs > 0".to_string();
@@ -347,15 +934,329 @@ impl App {
         };
     }
 
-    fn should_auto_refresh(&self) -> bool {
+    fn current_rss_category(&self) -> &str {
+        self.rss_categories
+            .get(self.rss_category_index)
+            .map(String::as_str)
+            .unwrap_or("All")
+    }
+
+    fn apply_rss_filters(&mut self) {
+        let selected_category = self.current_rss_category().to_string();
+        let query = self.rss_query.to_lowercase();
+        self.rss_view_items = self
+            .rss_items
+            .iter()
+            .filter(|item| selected_category == "All" || item.category == selected_category)
+            .filter(|item| {
+                if query.is_empty() {
+                    true
+                } else {
+                    item.title.to_lowercase().contains(&query)
+                        || item.summary.to_lowercase().contains(&query)
+                        || item.source_name.to_lowercase().contains(&query)
+                }
+            })
+            .cloned()
+            .collect();
+
+        if self.rss_view_items.is_empty() {
+            self.rss_selected = 0;
+        } else if self.rss_selected >= self.rss_view_items.len() {
+            self.rss_selected = self.rss_view_items.len().saturating_sub(1);
+        }
+        self.rss_detail_scroll = 0;
+    }
+
+    fn cycle_rss_category_next(&mut self) {
+        if self.rss_categories.is_empty() {
+            return;
+        }
+        self.rss_category_index = (self.rss_category_index + 1) % self.rss_categories.len();
+        self.apply_rss_filters();
+    }
+
+    fn cycle_rss_category_prev(&mut self) {
+        if self.rss_categories.is_empty() {
+            return;
+        }
+        if self.rss_category_index == 0 {
+            self.rss_category_index = self.rss_categories.len() - 1;
+        } else {
+            self.rss_category_index -= 1;
+        }
+        self.apply_rss_filters();
+    }
+
+    fn cycle_rss_variant(&mut self) {
+        self.rss_variant = self.rss_variant.next();
+        self.rss_categories = categories_for_variant(self.rss_variant);
+        self.rss_category_index = 0;
+        self.rss_items.clear();
+        self.rss_view_items.clear();
+        self.rss_selected = 0;
+        self.rss_detail_scroll = 0;
+        self.rss_last_fetch_summary =
+            format!("Switched to {} variant; refreshing feeds", self.rss_variant);
+    }
+
+    fn rss_select_next(&mut self) {
+        if self.rss_view_items.is_empty() {
+            self.rss_selected = 0;
+            return;
+        }
+        self.rss_selected = (self.rss_selected + 1) % self.rss_view_items.len();
+        self.rss_detail_scroll = 0;
+    }
+
+    fn rss_select_prev(&mut self) {
+        if self.rss_view_items.is_empty() {
+            self.rss_selected = 0;
+            return;
+        }
+        if self.rss_selected == 0 {
+            self.rss_selected = self.rss_view_items.len() - 1;
+        } else {
+            self.rss_selected -= 1;
+        }
+        self.rss_detail_scroll = 0;
+    }
+
+    fn rss_detail_scroll_down(&mut self) {
+        self.rss_detail_scroll = self.rss_detail_scroll.saturating_add(1);
+    }
+
+    fn rss_detail_scroll_up(&mut self) {
+        self.rss_detail_scroll = self.rss_detail_scroll.saturating_sub(1);
+    }
+
+    fn enter_rss_search_editor(&mut self) {
+        self.rss_input_mode = RssInputMode::Search;
+        self.rss_search_editor = build_single_line_editor("Search RSS (Enter apply, Esc cancel)");
+        if !self.rss_query.is_empty() {
+            self.rss_search_editor.insert_str(self.rss_query.clone());
+        }
+        self.status_line = "Editing RSS search query".to_string();
+    }
+
+    fn enter_rss_keywords_editor(&mut self) {
+        self.rss_input_mode = RssInputMode::Keywords;
+        self.rss_keywords_editor =
+            build_single_line_editor("Keywords (comma-separated, Enter apply, Esc cancel)");
+        if !self.rss_keywords.is_empty() {
+            self.rss_keywords_editor
+                .insert_str(self.rss_keywords.join(", "));
+        }
+        self.status_line = "Editing keyword monitors".to_string();
+    }
+
+    fn reset_rss_filters(&mut self) {
+        self.rss_query.clear();
+        self.rss_category_index = 0;
+        self.apply_rss_filters();
+        self.status_line = "Cleared RSS filters".to_string();
+    }
+
+    fn rss_editor_active(&self) -> bool {
+        self.rss_input_mode != RssInputMode::None
+    }
+
+    fn brief_editor_active(&self) -> bool {
+        self.brief_input_mode != BriefInputMode::None
+    }
+
+    fn set_brief_country_code(&mut self, country_code: String) {
+        self.brief_country_code = country_code.to_uppercase();
+        if let Some((index, _)) = BRIEF_COUNTRIES
+            .iter()
+            .enumerate()
+            .find(|(_, (code, _))| *code == self.brief_country_code)
+        {
+            self.brief_country_index = index;
+        }
+        self.brief_brief_scroll = 0;
+        self.brief_news_scroll = 0;
+    }
+
+    fn enter_brief_country_editor(&mut self) {
+        self.brief_input_mode = BriefInputMode::CountryCode;
+        self.brief_country_editor =
+            build_single_line_editor("Country code (ISO-2, Enter apply, Esc cancel)");
+        self.brief_country_editor
+            .insert_str(self.brief_country_code.clone());
+        self.status_line = "Editing BRIEF country code".to_string();
+    }
+
+    fn cycle_brief_country_next(&mut self) {
+        if BRIEF_COUNTRIES.is_empty() {
+            return;
+        }
+        self.brief_country_index = (self.brief_country_index + 1) % BRIEF_COUNTRIES.len();
+        self.set_brief_country_code(BRIEF_COUNTRIES[self.brief_country_index].0.to_string());
+        self.status_line = format!(
+            "Selected {} ({})",
+            BRIEF_COUNTRIES[self.brief_country_index].1, self.brief_country_code
+        );
+    }
+
+    fn cycle_brief_country_prev(&mut self) {
+        if BRIEF_COUNTRIES.is_empty() {
+            return;
+        }
+        if self.brief_country_index == 0 {
+            self.brief_country_index = BRIEF_COUNTRIES.len() - 1;
+        } else {
+            self.brief_country_index -= 1;
+        }
+        self.set_brief_country_code(BRIEF_COUNTRIES[self.brief_country_index].0.to_string());
+        self.status_line = format!(
+            "Selected {} ({})",
+            BRIEF_COUNTRIES[self.brief_country_index].1, self.brief_country_code
+        );
+    }
+
+    fn refresh_brief_related_rss(&mut self) {
+        let Some(snapshot) = self.brief_snapshot.as_ref() else {
+            self.brief_related_rss.clear();
+            self.brief_related_selected = 0;
+            self.brief_news_scroll = 0;
+            return;
+        };
+
+        let mut terms = brief_country_aliases(snapshot.country_code.as_str())
+            .iter()
+            .map(|term| term.to_lowercase())
+            .collect::<Vec<_>>();
+        terms.extend(
+            snapshot
+                .country_name
+                .split(|ch: char| !ch.is_ascii_alphabetic())
+                .map(str::trim)
+                .filter(|term| term.len() >= 4)
+                .map(|term| term.to_lowercase()),
+        );
+        terms.sort();
+        terms.dedup();
+
+        if terms.is_empty() {
+            self.brief_related_rss.clear();
+            self.brief_related_selected = 0;
+            self.brief_news_scroll = 0;
+            return;
+        }
+
+        self.brief_related_rss = self
+            .rss_items
+            .iter()
+            .filter(|item| {
+                let haystack = format!("{} {} {}", item.title, item.summary, item.source_name);
+                terms
+                    .iter()
+                    .any(|term| contains_keyword_word(haystack.as_str(), term))
+            })
+            .take(40)
+            .cloned()
+            .collect();
+
+        if self.brief_related_rss.is_empty() {
+            self.brief_related_selected = 0;
+            self.brief_news_scroll = 0;
+            return;
+        }
+        if self.brief_related_selected >= self.brief_related_rss.len() {
+            self.brief_related_selected = self.brief_related_rss.len() - 1;
+        }
+        self.brief_news_scroll = 0;
+    }
+
+    fn brief_select_next(&mut self) {
+        if self.brief_related_rss.is_empty() {
+            self.brief_related_selected = 0;
+            return;
+        }
+        self.brief_related_selected =
+            (self.brief_related_selected + 1) % self.brief_related_rss.len();
+        self.brief_news_scroll = 0;
+    }
+
+    fn brief_select_prev(&mut self) {
+        if self.brief_related_rss.is_empty() {
+            self.brief_related_selected = 0;
+            return;
+        }
+        if self.brief_related_selected == 0 {
+            self.brief_related_selected = self.brief_related_rss.len() - 1;
+        } else {
+            self.brief_related_selected -= 1;
+        }
+        self.brief_news_scroll = 0;
+    }
+
+    fn brief_scroll_down(&mut self) {
+        self.brief_brief_scroll = self.brief_brief_scroll.saturating_add(1);
+    }
+
+    fn brief_scroll_up(&mut self) {
+        self.brief_brief_scroll = self.brief_brief_scroll.saturating_sub(1);
+    }
+
+    fn brief_news_scroll_down(&mut self) {
+        self.brief_news_scroll = self.brief_news_scroll.saturating_add(1);
+    }
+
+    fn brief_news_scroll_up(&mut self) {
+        self.brief_news_scroll = self.brief_news_scroll.saturating_sub(1);
+    }
+
+    fn should_auto_refresh_api(&self) -> bool {
         let Some(interval) = self.refresh_interval else {
             return false;
         };
-        if !self.auto_refresh_enabled || self.in_flight || self.editing_request {
+        if !self.auto_refresh_enabled
+            || self.in_flight
+            || self.editing_request
+            || self.view != AppView::Api
+        {
             return false;
         }
 
         match self.last_fetch_finished_at {
+            Some(last) => last.elapsed() >= interval,
+            None => true,
+        }
+    }
+
+    fn should_auto_refresh_rss(&self) -> bool {
+        let Some(interval) = self.refresh_interval else {
+            return false;
+        };
+        if !self.auto_refresh_enabled
+            || self.rss_in_flight
+            || self.rss_editor_active()
+            || self.view != AppView::Rss
+        {
+            return false;
+        }
+
+        match self.rss_last_fetch_finished_at {
+            Some(last) => last.elapsed() >= interval,
+            None => true,
+        }
+    }
+
+    fn should_auto_refresh_brief(&self) -> bool {
+        let Some(interval) = self.refresh_interval else {
+            return false;
+        };
+        if !self.auto_refresh_enabled
+            || self.brief_in_flight
+            || self.brief_editor_active()
+            || self.view != AppView::Brief
+        {
+            return false;
+        }
+
+        match self.brief_last_fetch_finished_at {
             Some(last) => last.elapsed() >= interval,
             None => true,
         }
@@ -369,7 +1270,13 @@ impl App {
             return format!("auto-refresh: paused ({}s)", interval.as_secs());
         }
 
-        let remaining = match self.last_fetch_finished_at {
+        let base = match self.view {
+            AppView::Api => self.last_fetch_finished_at,
+            AppView::Rss => self.rss_last_fetch_finished_at,
+            AppView::Brief => self.brief_last_fetch_finished_at,
+        };
+
+        let remaining = match base {
             Some(last) => interval.saturating_sub(last.elapsed()).as_secs(),
             None => 0,
         };
@@ -382,13 +1289,18 @@ impl App {
 }
 
 enum WorkerEvent {
-    Success {
+    ApiSuccess {
         endpoint: Endpoint,
         lines: Vec<String>,
     },
-    Failure {
+    ApiFailure {
         endpoint: Endpoint,
         error: String,
+    },
+    RssSuccess(RssFetchResult),
+    BriefSuccess {
+        snapshot: BriefSnapshot,
+        duration_ms: u128,
     },
 }
 
@@ -400,6 +1312,15 @@ fn truncate_for_error(input: &str, max_chars: usize) -> String {
     let mut shortened = normalized.chars().take(max_chars).collect::<String>();
     shortened.push_str("...");
     shortened
+}
+
+fn format_error_chain(error: &anyhow::Error, max_chars: usize) -> String {
+    let joined = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    truncate_for_error(joined.as_str(), max_chars)
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -659,6 +1580,28 @@ fn build_request_editor(content: &str, editing: bool, endpoint: Endpoint) -> Tex
     textarea
 }
 
+fn build_single_line_editor(title: &str) -> TextArea<'static> {
+    let mut textarea = TextArea::new(vec![String::new()]);
+    textarea.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string()),
+    );
+    textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+    textarea
+}
+
+fn categories_for_variant(variant: FeedVariant) -> Vec<String> {
+    let mut set = HashSet::new();
+    let mut categories = vec!["All".to_string()];
+    for source in feed_sources_for_variant(variant) {
+        if set.insert(source.category) {
+            categories.push(source.category.to_string());
+        }
+    }
+    categories
+}
+
 fn format_payload(endpoint: Endpoint, payload: Value) -> Result<Vec<String>> {
     match endpoint {
         Endpoint::SeismologyEarthquakes => format_earthquakes(payload),
@@ -855,7 +1798,516 @@ fn format_crypto_quotes(payload: Value) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-fn start_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent>) {
+fn now_epoch_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
+}
+
+fn strip_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for c in input.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    decode_basic_entities(out.trim())
+}
+
+fn decode_basic_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn normalize_title_for_dedup(title: &str) -> String {
+    title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_keyword_word(haystack: &str, keyword: &str) -> bool {
+    let hay = haystack.to_lowercase();
+    let needle = keyword.to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+
+    let mut search_from = 0usize;
+    while let Some(rel_pos) = hay[search_from..].find(&needle) {
+        let start = search_from + rel_pos;
+        let end = start + needle.len();
+        let prev_ok = if start == 0 {
+            true
+        } else {
+            !hay[..start]
+                .chars()
+                .next_back()
+                .unwrap_or(' ')
+                .is_ascii_alphanumeric()
+        };
+        let next_ok = if end >= hay.len() {
+            true
+        } else {
+            !hay[end..]
+                .chars()
+                .next()
+                .unwrap_or(' ')
+                .is_ascii_alphanumeric()
+        };
+        if prev_ok && next_ok {
+            return true;
+        }
+        search_from = end;
+    }
+
+    false
+}
+
+fn format_age(ts_ms: i64) -> String {
+    if ts_ms <= 0 {
+        return "unknown".to_string();
+    }
+    let delta_sec = (now_epoch_ms().saturating_sub(ts_ms) / 1000).max(0);
+    if delta_sec < 60 {
+        return format!("{}s", delta_sec);
+    }
+    if delta_sec < 3600 {
+        return format!("{}m", delta_sec / 60);
+    }
+    if delta_sec < 86_400 {
+        return format!("{}h", delta_sec / 3600);
+    }
+    format!("{}d", delta_sec / 86_400)
+}
+
+fn spinner_symbol() -> &'static str {
+    match (now_epoch_ms().div_euclid(220)).rem_euclid(4) {
+        0 => "⠋",
+        1 => "⠙",
+        2 => "⠹",
+        _ => "⠸",
+    }
+}
+
+fn sanitize_filename_part(input: &str) -> String {
+    let clean = input
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    clean
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn export_brief_snapshot(
+    snapshot: &BriefSnapshot,
+    related_rss: &[RssItem],
+) -> Result<(PathBuf, PathBuf)> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output_dir = manifest_dir.join("exports").join("briefs");
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let stamp = now_epoch_ms();
+    let country_code = if snapshot.country_code.is_empty() {
+        "xx".to_string()
+    } else {
+        snapshot.country_code.to_lowercase()
+    };
+    let slug = sanitize_filename_part(snapshot.country_name.as_str());
+    let base = if slug.is_empty() {
+        format!("brief-{}-{}", country_code, stamp)
+    } else {
+        format!("brief-{}-{}-{}", country_code, slug, stamp)
+    };
+
+    let json_path = output_dir.join(format!("{}.json", base));
+    let txt_path = output_dir.join(format!("{}.txt", base));
+
+    let related_json = related_rss
+        .iter()
+        .map(|item| {
+            json!({
+                "title": item.title,
+                "source": item.source_name,
+                "category": item.category,
+                "publishedTsMs": item.published_ts_ms,
+                "summary": item.summary,
+                "link": item.link,
+                "keywordHits": item.keyword_hits,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let payload = json!({
+        "exportedAtMs": stamp,
+        "countryCode": snapshot.country_code,
+        "countryName": snapshot.country_name,
+        "intelBrief": snapshot.intel_brief,
+        "intelModel": snapshot.intel_model,
+        "intelGeneratedAtMs": snapshot.intel_generated_at,
+        "ciiScore": snapshot.cii_score,
+        "ciiTrend": snapshot.cii_trend,
+        "strategicLevel": snapshot.strategic_level,
+        "stock": {
+            "available": snapshot.stock_available,
+            "indexName": snapshot.stock_index_name,
+            "price": snapshot.stock_price,
+            "weekChangePercent": snapshot.stock_week_change,
+            "currency": snapshot.stock_currency,
+        },
+        "warnings": snapshot.errors,
+        "relatedRss": related_json
+    });
+    fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&payload).context("failed to serialize brief export JSON")?,
+    )
+    .with_context(|| format!("failed to write {}", json_path.display()))?;
+
+    let mut text_lines = vec![
+        format!(
+            "WorldMonitor Brief Export | {} ({})",
+            snapshot.country_name, snapshot.country_code
+        ),
+        format!("Exported at (ms): {}", stamp),
+        String::new(),
+        format!(
+            "CII: {} | Trend: {} | Strategic: {}",
+            snapshot
+                .cii_score
+                .map(|score| format!("{:.1}/100", score))
+                .unwrap_or_else(|| "n/a".to_string()),
+            compact_enum_label(snapshot.cii_trend.as_str()),
+            compact_enum_label(snapshot.strategic_level.as_str())
+        ),
+        format!(
+            "Stock: {}",
+            if snapshot.stock_available {
+                format!(
+                    "{} {:.2} {} ({:+.2}% 1W)",
+                    snapshot.stock_index_name,
+                    snapshot.stock_price,
+                    snapshot.stock_currency,
+                    snapshot.stock_week_change
+                )
+            } else {
+                "Unavailable".to_string()
+            }
+        ),
+        String::new(),
+        "Intel Brief:".to_string(),
+        snapshot.intel_brief.clone(),
+        String::new(),
+    ];
+
+    if snapshot.errors.is_empty() {
+        text_lines.push("Warnings: none".to_string());
+    } else {
+        text_lines.push("Warnings:".to_string());
+        text_lines.extend(snapshot.errors.iter().map(|err| format!("- {}", err)));
+    }
+    text_lines.push(String::new());
+    text_lines.push(format!("Related RSS headlines: {}", related_rss.len()));
+    for (index, item) in related_rss.iter().take(25).enumerate() {
+        text_lines.push(format!(
+            "{}. [{}] {} | {}",
+            index + 1,
+            item.source_name,
+            item.title,
+            item.link
+        ));
+    }
+
+    fs::write(&txt_path, text_lines.join("\n"))
+        .with_context(|| format!("failed to write {}", txt_path.display()))?;
+
+    Ok((json_path, txt_path))
+}
+
+fn build_item_from_entry(
+    source: FeedSource,
+    entry: &feed_rs::model::Entry,
+    keywords: &[String],
+) -> Option<RssItem> {
+    let title = strip_html(entry.title.as_ref()?.content.trim());
+    if title.is_empty() {
+        return None;
+    }
+
+    let link = entry
+        .links
+        .first()
+        .map(|link| link.href.clone())
+        .unwrap_or_default();
+
+    let summary = entry
+        .summary
+        .as_ref()
+        .map(|summary| strip_html(summary.content.trim()))
+        .or_else(|| {
+            entry
+                .content
+                .as_ref()
+                .and_then(|content| content.body.as_ref())
+                .map(|body| strip_html(body))
+        })
+        .unwrap_or_default();
+
+    let published_ts_ms = entry
+        .published
+        .or(entry.updated)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(now_epoch_ms);
+
+    let body = format!("{title} {summary}");
+    let keyword_hits = keywords
+        .iter()
+        .filter(|keyword| contains_keyword_word(&body, keyword))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Some(RssItem {
+        id: format!("{}:{}", source.id, entry.id),
+        title,
+        summary,
+        link,
+        source_name: source.name.to_string(),
+        category: source.category.to_string(),
+        published_ts_ms,
+        keyword_hits,
+    })
+}
+
+fn fetch_rss_snapshot(
+    client: Client,
+    variant: FeedVariant,
+    previous_health: HashMap<String, FeedHealth>,
+    keywords: Vec<String>,
+) -> RssFetchResult {
+    let started = Instant::now();
+    let now = Instant::now();
+    let mut health = previous_health;
+    let mut items = Vec::new();
+    let mut fetched_feeds = 0usize;
+    let mut skipped_cooldown = 0usize;
+    let mut failed_feeds = 0usize;
+
+    for source in feed_sources_for_variant(variant) {
+        let entry = health.entry(source.id.to_string()).or_default();
+        if let Some(until) = entry.cooldown_until
+            && until > now
+        {
+            skipped_cooldown += 1;
+            continue;
+        }
+
+        let response = client
+            .get(source.url)
+            .header(
+                "Accept",
+                "application/rss+xml, application/atom+xml, text/xml, application/xml, */*",
+            )
+            .header("User-Agent", "worldmonitor-v2-rust/0.1")
+            .send();
+
+        let bytes = match response {
+            Ok(resp) if resp.status().is_success() => match resp.bytes() {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                    entry.last_error = Some(format!("Body read failed: {err}"));
+                    failed_feeds += 1;
+                    continue;
+                }
+            },
+            Ok(resp) => {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                entry.last_error = Some(format!("HTTP {}", resp.status().as_u16()));
+                failed_feeds += 1;
+                continue;
+            }
+            Err(err) => {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                entry.last_error = Some(err.to_string());
+                failed_feeds += 1;
+                continue;
+            }
+        };
+
+        let feed = match parser::parse(&bytes[..]) {
+            Ok(feed) => feed,
+            Err(err) => {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                entry.last_error = Some(format!("Parse error: {err}"));
+                failed_feeds += 1;
+                continue;
+            }
+        };
+
+        entry.consecutive_failures = 0;
+        entry.cooldown_until = None;
+        entry.last_error = None;
+        entry.last_success = Some(Instant::now());
+        fetched_feeds += 1;
+
+        for entry in &feed.entries {
+            if let Some(item) = build_item_from_entry(*source, entry, &keywords) {
+                items.push(item);
+            }
+        }
+    }
+
+    for state in health.values_mut() {
+        if state.consecutive_failures >= 3 {
+            state.cooldown_until = Some(Instant::now() + Duration::from_secs(300));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(normalize_title_for_dedup(&item.title)));
+    items.sort_by(|a, b| b.published_ts_ms.cmp(&a.published_ts_ms));
+
+    let mut keyword_counts = HashMap::new();
+    for keyword in &keywords {
+        let count = items
+            .iter()
+            .filter(|item| item.keyword_hits.iter().any(|hit| hit == keyword))
+            .count();
+        keyword_counts.insert(keyword.to_lowercase(), count);
+    }
+
+    RssFetchResult {
+        items,
+        updated_health: health,
+        fetched_feeds,
+        skipped_cooldown,
+        failed_feeds,
+        duration_ms: started.elapsed().as_millis(),
+        keyword_counts,
+    }
+}
+
+fn fetch_country_brief_snapshot(api: &ApiClient, country_code: &str) -> BriefSnapshot {
+    let normalized_code = country_code.to_uppercase();
+    let mut snapshot = BriefSnapshot {
+        country_code: normalized_code.clone(),
+        country_name: country_name_from_code(&normalized_code),
+        cii_trend: "TREND_DIRECTION_UNSPECIFIED".to_string(),
+        strategic_level: "SEVERITY_LEVEL_UNSPECIFIED".to_string(),
+        ..BriefSnapshot::default()
+    };
+
+    match api.get_country_intel_brief(&normalized_code) {
+        Ok(intel) => {
+            if !intel.country_code.is_empty() {
+                snapshot.country_code = intel.country_code.to_uppercase();
+            }
+            if !intel.country_name.is_empty() {
+                snapshot.country_name = intel.country_name;
+            }
+            snapshot.intel_brief = intel.brief;
+            snapshot.intel_model = intel.model;
+            snapshot.intel_generated_at = intel.generated_at;
+            if snapshot.intel_brief.trim().is_empty() {
+                snapshot
+                    .errors
+                    .push("Intel brief unavailable (provider returned empty result)".to_string());
+            }
+        }
+        Err(error) => snapshot.errors.push(format!(
+            "Intel brief request failed: {}",
+            format_error_chain(&error, 280)
+        )),
+    }
+
+    match api.get_risk_scores(snapshot.country_code.as_str()) {
+        Ok(risk) => {
+            if let Some(cii) = risk.cii_scores.iter().find(|score| {
+                score
+                    .region
+                    .eq_ignore_ascii_case(snapshot.country_code.as_str())
+            }) {
+                snapshot.cii_score = Some(cii.combined_score);
+                if !cii.trend.is_empty() {
+                    snapshot.cii_trend = cii.trend.clone();
+                }
+            } else {
+                snapshot
+                    .errors
+                    .push(format!("No CII score found for {}", snapshot.country_code));
+            }
+
+            if let Some(strategic) = risk
+                .strategic_risks
+                .iter()
+                .find(|risk| {
+                    risk.region
+                        .eq_ignore_ascii_case(snapshot.country_code.as_str())
+                })
+                .or_else(|| {
+                    risk.strategic_risks
+                        .iter()
+                        .find(|risk| risk.region.eq_ignore_ascii_case("global"))
+                })
+                && !strategic.level.is_empty()
+            {
+                snapshot.strategic_level = strategic.level.clone();
+            }
+        }
+        Err(error) => snapshot.errors.push(format!(
+            "Risk score request failed: {}",
+            format_error_chain(&error, 280)
+        )),
+    }
+
+    match api.get_country_stock_index(snapshot.country_code.as_str()) {
+        Ok(stock) => {
+            snapshot.stock_available = stock.available;
+            snapshot.stock_index_name = stock.index_name;
+            snapshot.stock_price = stock.price;
+            snapshot.stock_week_change = stock.week_change_percent;
+            snapshot.stock_currency = stock.currency;
+            if !stock.code.is_empty() && stock.code != snapshot.country_code {
+                snapshot.errors.push(format!(
+                    "Stock endpoint returned mismatched code {}",
+                    stock.code
+                ));
+            }
+            if !snapshot.stock_available {
+                snapshot.errors.push(format!(
+                    "No mapped stock index for {}",
+                    snapshot.country_code
+                ));
+            }
+        }
+        Err(error) => snapshot.errors.push(format!(
+            "Stock index request failed: {}",
+            format_error_chain(&error, 280)
+        )),
+    }
+
+    snapshot
+}
+
+fn start_api_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent>) {
     if app.in_flight {
         return;
     }
@@ -885,8 +2337,8 @@ fn start_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent>) {
             .fetch_json(endpoint, &request_body)
             .and_then(|payload| format_payload(endpoint, payload));
         let event = match result {
-            Ok(lines) => WorkerEvent::Success { endpoint, lines },
-            Err(error) => WorkerEvent::Failure {
+            Ok(lines) => WorkerEvent::ApiSuccess { endpoint, lines },
+            Err(error) => WorkerEvent::ApiFailure {
                 endpoint,
                 error: error.to_string(),
             },
@@ -895,17 +2347,64 @@ fn start_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent>) {
     });
 }
 
+fn start_rss_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent>) {
+    if app.rss_in_flight {
+        return;
+    }
+
+    app.rss_in_flight = true;
+    app.status_line = format!("Refreshing RSS feeds for {} variant", app.rss_variant);
+
+    let client = api.client.clone();
+    let variant = app.rss_variant;
+    let previous_health = app.rss_feed_health.clone();
+    let keywords = app.rss_keywords.clone();
+    let sender = sender.clone();
+
+    thread::spawn(move || {
+        let result = fetch_rss_snapshot(client, variant, previous_health, keywords);
+        let _ = sender.send(WorkerEvent::RssSuccess(result));
+    });
+}
+
+fn start_brief_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent>) {
+    if app.brief_in_flight {
+        return;
+    }
+
+    let country_code = app.brief_country_code.trim().to_uppercase();
+    if !is_valid_country_code(&country_code) {
+        app.status_line = "Invalid country code (use ISO-2 like US, GB, JP)".to_string();
+        return;
+    }
+
+    app.set_brief_country_code(country_code.clone());
+    app.brief_in_flight = true;
+    app.status_line = format!("Generating country brief for {}", country_code);
+
+    let api = api.clone();
+    let sender = sender.clone();
+    thread::spawn(move || {
+        let started = Instant::now();
+        let snapshot = fetch_country_brief_snapshot(&api, country_code.as_str());
+        let _ = sender.send(WorkerEvent::BriefSuccess {
+            snapshot,
+            duration_ms: started.elapsed().as_millis(),
+        });
+    });
+}
+
 fn apply_worker_events(app: &mut App, receiver: &Receiver<WorkerEvent>) {
     while let Ok(event) = receiver.try_recv() {
         match event {
-            WorkerEvent::Success { endpoint, lines } => {
+            WorkerEvent::ApiSuccess { endpoint, lines } => {
                 app.output_lines = lines;
                 app.status_line = format!("Loaded {}", endpoint);
                 app.in_flight = false;
                 app.scroll = 0;
                 app.last_fetch_finished_at = Some(Instant::now());
             }
-            WorkerEvent::Failure { endpoint, error } => {
+            WorkerEvent::ApiFailure { endpoint, error } => {
                 app.output_lines = vec![
                     format!("Request failed for {}", endpoint),
                     String::new(),
@@ -918,6 +2417,76 @@ fn apply_worker_events(app: &mut App, receiver: &Receiver<WorkerEvent>) {
                 app.in_flight = false;
                 app.scroll = 0;
                 app.last_fetch_finished_at = Some(Instant::now());
+            }
+            WorkerEvent::RssSuccess(result) => {
+                app.rss_items = result.items;
+                app.rss_feed_health = result.updated_health;
+                app.rss_last_fetch_finished_at = Some(Instant::now());
+                app.rss_in_flight = false;
+                app.apply_rss_filters();
+
+                let mut spikes = Vec::new();
+                for (keyword, count) in &result.keyword_counts {
+                    let baseline = app
+                        .rss_keyword_baseline
+                        .entry(keyword.clone())
+                        .or_insert(*count as f64);
+                    if *count >= 3 && (*count as f64) >= (*baseline * 2.0) && *baseline > 0.0 {
+                        spikes.push(format!("{keyword}: {} -> {}", *baseline as usize, count));
+                    }
+                    *baseline = (*baseline * 0.7) + ((*count as f64) * 0.3);
+                }
+                app.rss_spikes = spikes;
+                app.rss_last_fetch_summary = format!(
+                    "{} feeds ok | {} failed | {} cooldown | {} items | {}ms",
+                    result.fetched_feeds,
+                    result.failed_feeds,
+                    result.skipped_cooldown,
+                    app.rss_items.len(),
+                    result.duration_ms
+                );
+                app.status_line = format!(
+                    "RSS updated: {} headlines for {}",
+                    app.rss_items.len(),
+                    app.rss_variant
+                );
+                app.refresh_brief_related_rss();
+            }
+            WorkerEvent::BriefSuccess {
+                mut snapshot,
+                duration_ms,
+            } => {
+                if snapshot.country_name.is_empty() {
+                    snapshot.country_name = country_name_from_code(snapshot.country_code.as_str());
+                }
+                app.brief_in_flight = false;
+                app.brief_last_fetch_finished_at = Some(Instant::now());
+                app.set_brief_country_code(snapshot.country_code.clone());
+                app.brief_snapshot = Some(snapshot.clone());
+                app.refresh_brief_related_rss();
+                let all_core_sections_missing = snapshot.intel_brief.trim().is_empty()
+                    && snapshot.cii_score.is_none()
+                    && !snapshot.stock_available;
+                app.brief_last_fetch_summary = format!(
+                    "{} | {} warnings | {}ms",
+                    snapshot.country_code,
+                    snapshot.errors.len(),
+                    duration_ms
+                );
+                app.status_line = if snapshot.errors.is_empty() {
+                    format!("BRIEF updated for {}", snapshot.country_code)
+                } else if all_core_sections_missing {
+                    format!(
+                        "BRIEF unavailable at current base URL for {} (check --base-url / --api-key)",
+                        snapshot.country_code
+                    )
+                } else {
+                    format!(
+                        "BRIEF updated for {} with {} warnings",
+                        snapshot.country_code,
+                        snapshot.errors.len()
+                    )
+                };
             }
         }
     }
@@ -938,7 +2507,7 @@ fn handle_editor_key(app: &mut App, key: KeyEvent, api: &ApiClient, sender: &Sen
                 }
                 app.editing_request = false;
                 app.ensure_editor_synced();
-                start_fetch(app, api, sender);
+                start_api_fetch(app, api, sender);
             }
             KeyCode::Char('t') => app.reset_editor_to_template(),
             _ => {
@@ -957,16 +2526,167 @@ fn handle_editor_key(app: &mut App, key: KeyEvent, api: &ApiClient, sender: &Sen
     }
 }
 
+fn handle_rss_input_key(
+    app: &mut App,
+    key: KeyEvent,
+    api: &ApiClient,
+    sender: &Sender<WorkerEvent>,
+) {
+    match app.rss_input_mode {
+        RssInputMode::Search => match key.code {
+            KeyCode::Esc => {
+                app.rss_input_mode = RssInputMode::None;
+                app.status_line = "Cancelled RSS search edit".to_string();
+            }
+            KeyCode::Enter => {
+                app.rss_query = app.rss_search_editor.lines().join("").trim().to_string();
+                app.rss_input_mode = RssInputMode::None;
+                app.apply_rss_filters();
+                app.status_line = if app.rss_query.is_empty() {
+                    "Cleared RSS query".to_string()
+                } else {
+                    format!("Applied RSS query: {}", app.rss_query)
+                };
+            }
+            _ => {
+                let _ = app.rss_search_editor.input(TextInput::from(key));
+            }
+        },
+        RssInputMode::Keywords => match key.code {
+            KeyCode::Esc => {
+                app.rss_input_mode = RssInputMode::None;
+                app.status_line = "Cancelled keyword edit".to_string();
+            }
+            KeyCode::Enter => {
+                let raw = app.rss_keywords_editor.lines().join("");
+                app.rss_keywords = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|keyword| !keyword.is_empty())
+                    .map(|keyword| keyword.to_lowercase())
+                    .collect::<Vec<_>>();
+                app.rss_input_mode = RssInputMode::None;
+                app.status_line = format!("Updated {} keyword monitors", app.rss_keywords.len());
+                start_rss_fetch(app, api, sender);
+            }
+            _ => {
+                let _ = app.rss_keywords_editor.input(TextInput::from(key));
+            }
+        },
+        RssInputMode::None => {}
+    }
+}
+
+fn handle_brief_input_key(
+    app: &mut App,
+    key: KeyEvent,
+    api: &ApiClient,
+    sender: &Sender<WorkerEvent>,
+) {
+    match app.brief_input_mode {
+        BriefInputMode::CountryCode => match key.code {
+            KeyCode::Esc => {
+                app.brief_input_mode = BriefInputMode::None;
+                app.status_line = "Cancelled BRIEF country edit".to_string();
+            }
+            KeyCode::Enter => {
+                let code = app
+                    .brief_country_editor
+                    .lines()
+                    .join("")
+                    .trim()
+                    .to_uppercase();
+                if !is_valid_country_code(code.as_str()) {
+                    app.status_line = "Invalid country code (must be two letters)".to_string();
+                    return;
+                }
+                app.set_brief_country_code(code);
+                app.brief_input_mode = BriefInputMode::None;
+                start_brief_fetch(app, api, sender);
+            }
+            _ => {
+                let _ = app.brief_country_editor.input(TextInput::from(key));
+            }
+        },
+        BriefInputMode::None => {}
+    }
+}
+
 fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
         .split(area);
+
+    let tabs = match app.view {
+        AppView::Api => "Workspace: [ API ]  RSS    BRIEF   (Tab switch)",
+        AppView::Rss => "Workspace:   API  [ RSS ]  BRIEF   (Tab switch)",
+        AppView::Brief => "Workspace:   API    RSS   [ BRIEF ] (Tab switch)",
+    };
+    frame.render_widget(
+        Paragraph::new(tabs).style(Style::default().fg(Color::Cyan)),
+        vertical[0],
+    );
+
+    match app.view {
+        AppView::Api => draw_api_workspace(frame, vertical[1], app),
+        AppView::Rss => draw_rss_workspace(frame, vertical[1], app),
+        AppView::Brief => draw_brief_workspace(frame, vertical[1], app),
+    }
+
+    let footer_style = if app.in_flight || app.rss_in_flight || app.brief_in_flight {
+        Style::default().fg(Color::Yellow)
+    } else if app.editing_request || app.rss_editor_active() || app.brief_editor_active() {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+
+    let controls = match app.view {
+        AppView::Api => {
+            if app.editing_request {
+                "API EDIT | Ctrl+S save | Ctrl+R save+fetch | Ctrl+T reset | Esc discard"
+            } else {
+                "API | Up/Down endpoint | Enter/r fetch | e edit | t reset | a auto | Tab cycle | q quit"
+            }
+        }
+        AppView::Rss => {
+            if app.rss_editor_active() {
+                "RSS INPUT | Enter apply | Esc cancel"
+            } else {
+                "RSS | v variant | ←/→ category | ↑/↓ headlines | u/d detail | / search | m keywords | f refresh | a auto | Tab cycle | q quit"
+            }
+        }
+        AppView::Brief => {
+            if app.brief_editor_active() {
+                "BRIEF INPUT | Enter apply | Esc cancel"
+            } else {
+                "BRIEF | n/p country | c edit code | Enter/r/f refresh | x export | j/k brief scroll | ↑/↓ RSS | u/d RSS detail | a auto | Tab cycle | q quit"
+            }
+        }
+    };
+
+    let footer = Paragraph::new(format!(
+        "{} | {} | {}",
+        app.status_line,
+        app.auto_refresh_summary(),
+        controls
+    ))
+    .style(footer_style)
+    .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, vertical[2]);
+}
+
+fn draw_api_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(38), Constraint::Min(1)])
-        .split(vertical[0]);
+        .split(area);
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(12)])
@@ -979,7 +2699,11 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         .collect();
 
     let endpoint_list = List::new(endpoint_items)
-        .block(Block::default().borders(Borders::ALL).title("Endpoints"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("API Endpoints"),
+        )
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -1014,28 +2738,346 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             .wrap(Wrap { trim: false });
         frame.render_widget(request_preview, right_chunks[1]);
     }
+}
 
-    let footer_style = if app.in_flight {
-        Style::default().fg(Color::Yellow)
-    } else if app.editing_request {
-        Style::default().fg(Color::Cyan)
+fn draw_rss_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(40), Constraint::Min(1)])
+        .split(area);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(horizontal[1]);
+
+    let spikes = if app.rss_spikes.is_empty() {
+        "none".to_string()
     } else {
-        Style::default().fg(Color::Green)
+        app.rss_spikes.join(" | ")
     };
-    let controls = if app.editing_request {
-        "EDIT MODE | type JSON | Ctrl+S save | Ctrl+R save+fetch | Ctrl+T reset | Esc discard"
+    let control_lines = vec![
+        format!("Variant: {} (v)", app.rss_variant),
+        format!("Category: {} (←/→)", app.current_rss_category()),
+        format!(
+            "Search: {} (/ edit, t clear)",
+            if app.rss_query.is_empty() {
+                "<none>".to_string()
+            } else {
+                app.rss_query.clone()
+            }
+        ),
+        format!(
+            "Keywords: {} (m edit)",
+            if app.rss_keywords.is_empty() {
+                "<none>".to_string()
+            } else {
+                app.rss_keywords.join(", ")
+            }
+        ),
+        String::new(),
+        format!(
+            "Feeds tracked: {}",
+            feed_sources_for_variant(app.rss_variant).len()
+        ),
+        app.rss_last_fetch_summary.clone(),
+        format!("Spikes: {}", spikes),
+    ];
+
+    let left_panel = Paragraph::new(control_lines.join("\n"))
+        .block(Block::default().borders(Borders::ALL).title("RSS Controls"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(left_panel, horizontal[0]);
+
+    let headlines: Vec<ListItem<'_>> = app
+        .rss_view_items
+        .iter()
+        .map(|item| {
+            let marker = if item.keyword_hits.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", item.keyword_hits.join(","))
+            };
+            ListItem::new(format!(
+                "{} | {} | {}{}",
+                format_age(item.published_ts_ms),
+                item.source_name,
+                item.title,
+                marker
+            ))
+        })
+        .collect();
+
+    let headline_block_title = format!("Headlines ({})", app.rss_view_items.len());
+    let headline_list = List::new(headlines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(headline_block_title),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    let mut rss_state = ListState::default();
+    if !app.rss_view_items.is_empty() {
+        rss_state.select(Some(app.rss_selected));
+    }
+    frame.render_stateful_widget(headline_list, right[0], &mut rss_state);
+
+    if app.rss_editor_active() {
+        match app.rss_input_mode {
+            RssInputMode::Search => frame.render_widget(&app.rss_search_editor, right[1]),
+            RssInputMode::Keywords => frame.render_widget(&app.rss_keywords_editor, right[1]),
+            RssInputMode::None => {}
+        }
     } else {
-        "Up/Down endpoint | Enter/r fetch | e edit request | t reset template | a auto-refresh | j/k scroll | q quit"
+        let detail = app
+            .rss_view_items
+            .get(app.rss_selected)
+            .map(|item| {
+                let link = if item.link.is_empty() {
+                    "<no link>".to_string()
+                } else {
+                    item.link.clone()
+                };
+                format!(
+                    "Title: {}\nSource: {} | Category: {} | Age: {}\nID: {}\n\n{}\n\nLink: {}",
+                    item.title,
+                    item.source_name,
+                    item.category,
+                    format_age(item.published_ts_ms),
+                    item.id,
+                    item.summary,
+                    link
+                )
+            })
+            .unwrap_or_else(|| "No RSS items loaded yet. Press f to fetch.".to_string());
+
+        let details_panel = Paragraph::new(detail)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Headline Detail"),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.rss_detail_scroll, 0));
+        frame.render_widget(details_panel, right[1]);
+    }
+}
+
+fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(40), Constraint::Min(1)])
+        .split(area);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(62), Constraint::Min(10)])
+        .split(horizontal[1]);
+
+    let country_code = app.brief_country_code.as_str();
+    let snapshot = app
+        .brief_snapshot
+        .as_ref()
+        .filter(|snap| snap.country_code.eq_ignore_ascii_case(country_code));
+    let country_name = snapshot
+        .map(|snap| snap.country_name.clone())
+        .unwrap_or_else(|| country_name_from_code(country_code));
+    let cii_score = snapshot
+        .and_then(|snap| snap.cii_score)
+        .map(|score| format!("{:.1}/100", score))
+        .unwrap_or_else(|| "n/a".to_string());
+    let cii_trend = snapshot
+        .map(|snap| compact_enum_label(snap.cii_trend.as_str()).to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let strategic = snapshot
+        .map(|snap| compact_enum_label(snap.strategic_level.as_str()).to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let stock_line = snapshot
+        .map(|snap| {
+            if snap.stock_available {
+                format!(
+                    "{} {:.2} {} ({:+.2}% 1W)",
+                    snap.stock_index_name,
+                    snap.stock_price,
+                    snap.stock_currency,
+                    snap.stock_week_change
+                )
+            } else {
+                "Unavailable".to_string()
+            }
+        })
+        .unwrap_or_else(|| "n/a".to_string());
+    let intel_age = snapshot
+        .map(|snap| format_age(snap.intel_generated_at))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let warning_lines = snapshot
+        .map(|snap| {
+            if snap.errors.is_empty() {
+                vec!["Warnings: none".to_string()]
+            } else {
+                let mut lines = vec![format!("Warnings: {}", snap.errors.len())];
+                lines.extend(
+                    snap.errors
+                        .iter()
+                        .take(3)
+                        .map(|error| format!("- {}", error)),
+                );
+                lines
+            }
+        })
+        .unwrap_or_else(|| vec!["Warnings: none".to_string()]);
+
+    let mut overview_lines = vec![
+        format!("Country: {} ({})", country_name, country_code),
+        format!("CII: {} | Trend: {}", cii_score, cii_trend),
+        format!("Strategic: {}", strategic),
+        format!("Stock: {}", stock_line),
+        format!("Intel age: {}", intel_age),
+        format!("Related RSS: {}", app.brief_related_rss.len()),
+        if app.brief_in_flight {
+            format!("Status: {} refreshing brief...", spinner_symbol())
+        } else {
+            "Status: idle".to_string()
+        },
+        app.brief_last_fetch_summary.clone(),
+        String::new(),
+    ];
+    overview_lines.extend(warning_lines);
+    let overview = Paragraph::new(overview_lines.join("\n"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("BRIEF Overview"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(overview, horizontal[0]);
+
+    let brief_text = if app.brief_in_flight && snapshot.is_none() {
+        format!(
+            "{} Building country brief...\n\nAnalyzing geopolitical context\nAssessing risk baseline and trend\nFetching market index snapshot\nCorrelating with RSS signals",
+            spinner_symbol()
+        )
+    } else {
+        snapshot
+            .map(|snap| {
+                if snap.intel_brief.trim().is_empty() {
+                    if app.brief_in_flight {
+                        format!(
+                            "{} Refreshing intelligence narrative...\n\nPrevious cycle returned empty text.",
+                            spinner_symbol()
+                        )
+                    } else {
+                        "No intelligence brief returned yet. Press Enter/r/f to refresh."
+                            .to_string()
+                    }
+                } else {
+                    let mut text = String::new();
+                    if app.brief_in_flight {
+                        text.push_str(format!("{} Refreshing in background...\n\n", spinner_symbol()).as_str());
+                    }
+                    text.push_str(snap.intel_brief.as_str());
+                    text
+                }
+            })
+            .unwrap_or_else(|| "No intelligence brief loaded. Press Enter/r/f to fetch.".to_string())
     };
-    let footer = Paragraph::new(format!(
-        "{} | {} | {}",
-        app.status_line,
-        app.auto_refresh_summary(),
-        controls
-    ))
-    .style(footer_style)
-    .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, vertical[1]);
+
+    let brief_title = snapshot
+        .map(|snap| {
+            if snap.intel_model.is_empty() {
+                format!("Intel Brief ({})", snap.country_code)
+            } else {
+                format!("Intel Brief ({}, {})", snap.country_code, snap.intel_model)
+            }
+        })
+        .unwrap_or_else(|| format!("Intel Brief ({})", app.brief_country_code));
+    let brief_title = if app.brief_in_flight {
+        format!("{} {}", spinner_symbol(), brief_title)
+    } else {
+        brief_title
+    };
+
+    let brief_panel = Paragraph::new(brief_text)
+        .block(Block::default().borders(Borders::ALL).title(brief_title))
+        .wrap(Wrap { trim: false })
+        .scroll((app.brief_brief_scroll, 0));
+    frame.render_widget(brief_panel, right[0]);
+
+    if app.brief_editor_active() {
+        frame.render_widget(&app.brief_country_editor, right[1]);
+        return;
+    }
+
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(right[1]);
+
+    let related_items: Vec<ListItem<'_>> = app
+        .brief_related_rss
+        .iter()
+        .map(|item| {
+            ListItem::new(format!(
+                "{} | {} | {}",
+                format_age(item.published_ts_ms),
+                item.source_name,
+                item.title
+            ))
+        })
+        .collect();
+    let related_list = List::new(related_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Related RSS ({})", app.brief_related_rss.len())),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    let mut related_state = ListState::default();
+    if !app.brief_related_rss.is_empty() {
+        related_state.select(Some(app.brief_related_selected));
+    }
+    frame.render_stateful_widget(related_list, bottom[0], &mut related_state);
+
+    let related_detail = app
+        .brief_related_rss
+        .get(app.brief_related_selected)
+        .map(|item| {
+            let link = if item.link.is_empty() {
+                "<no link>".to_string()
+            } else {
+                item.link.clone()
+            };
+            format!(
+                "Title: {}\nSource: {} | Category: {} | Age: {}\n\n{}\n\nLink: {}",
+                item.title,
+                item.source_name,
+                item.category,
+                format_age(item.published_ts_ms),
+                item.summary,
+                link
+            )
+        })
+        .unwrap_or_else(|| {
+            "No related RSS headlines yet. Refresh RSS and BRIEF to correlate signals.".to_string()
+        });
+    let related_detail_panel = Paragraph::new(related_detail)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Related Headline Detail"),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.brief_news_scroll, 0));
+    frame.render_widget(related_detail_panel, bottom[1]);
 }
 
 fn run_app(
@@ -1046,12 +3088,18 @@ fn run_app(
     let mut app = App::new(refresh_interval);
     let (sender, receiver) = mpsc::channel::<WorkerEvent>();
 
-    start_fetch(&mut app, &api, &sender);
+    start_api_fetch(&mut app, &api, &sender);
 
     loop {
         apply_worker_events(&mut app, &receiver);
-        if app.should_auto_refresh() {
-            start_fetch(&mut app, &api, &sender);
+        if app.should_auto_refresh_api() {
+            start_api_fetch(&mut app, &api, &sender);
+        }
+        if app.should_auto_refresh_rss() {
+            start_rss_fetch(&mut app, &api, &sender);
+        }
+        if app.should_auto_refresh_brief() {
+            start_brief_fetch(&mut app, &api, &sender);
         }
         terminal
             .draw(|frame| draw_ui(frame, &app))
@@ -1070,23 +3118,114 @@ fn run_app(
                 continue;
             }
 
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Up => {
-                    app.select_prev();
+            if app.view == AppView::Rss && app.rss_editor_active() {
+                handle_rss_input_key(&mut app, key, &api, &sender);
+                continue;
+            }
+
+            if app.view == AppView::Brief && app.brief_editor_active() {
+                handle_brief_input_key(&mut app, key, &api, &sender);
+                continue;
+            }
+
+            if key.code == KeyCode::Tab {
+                app.toggle_view();
+                if app.view == AppView::Rss && app.rss_items.is_empty() && !app.rss_in_flight {
+                    start_rss_fetch(&mut app, &api, &sender);
+                }
+                if app.view == AppView::Brief
+                    && app.brief_snapshot.is_none()
+                    && !app.brief_in_flight
+                {
+                    start_brief_fetch(&mut app, &api, &sender);
+                }
+                if app.view == AppView::Api {
                     app.ensure_editor_synced();
                 }
-                KeyCode::Down => {
-                    app.select_next();
-                    app.ensure_editor_synced();
-                }
-                KeyCode::Char('j') => app.scroll_down(),
-                KeyCode::Char('k') => app.scroll_up(),
-                KeyCode::Enter | KeyCode::Char('r') => start_fetch(&mut app, &api, &sender),
-                KeyCode::Char('e') => app.enter_request_editor(),
-                KeyCode::Char('t') => app.reset_selected_request_to_template(),
-                KeyCode::Char('a') => app.toggle_auto_refresh(),
-                _ => {}
+                continue;
+            }
+
+            match app.view {
+                AppView::Api => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Up => {
+                        app.select_prev();
+                        app.ensure_editor_synced();
+                    }
+                    KeyCode::Down => {
+                        app.select_next();
+                        app.ensure_editor_synced();
+                    }
+                    KeyCode::Char('j') => app.scroll_down(),
+                    KeyCode::Char('k') => app.scroll_up(),
+                    KeyCode::Enter | KeyCode::Char('r') => start_api_fetch(&mut app, &api, &sender),
+                    KeyCode::Char('e') => app.enter_request_editor(),
+                    KeyCode::Char('t') => app.reset_selected_request_to_template(),
+                    KeyCode::Char('a') => app.toggle_auto_refresh(),
+                    _ => {}
+                },
+                AppView::Rss => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Up | KeyCode::Char('k') => app.rss_select_prev(),
+                    KeyCode::Down | KeyCode::Char('j') => app.rss_select_next(),
+                    KeyCode::Left => app.cycle_rss_category_prev(),
+                    KeyCode::Right => app.cycle_rss_category_next(),
+                    KeyCode::Char('u') => app.rss_detail_scroll_up(),
+                    KeyCode::Char('d') => app.rss_detail_scroll_down(),
+                    KeyCode::Char('a') => app.toggle_auto_refresh(),
+                    KeyCode::Char('v') => {
+                        app.cycle_rss_variant();
+                        start_rss_fetch(&mut app, &api, &sender);
+                    }
+                    KeyCode::Char('f') | KeyCode::Char('r') => {
+                        start_rss_fetch(&mut app, &api, &sender)
+                    }
+                    KeyCode::Char('/') => app.enter_rss_search_editor(),
+                    KeyCode::Char('m') => app.enter_rss_keywords_editor(),
+                    KeyCode::Char('t') => app.reset_rss_filters(),
+                    _ => {}
+                },
+                AppView::Brief => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('f') => {
+                        start_brief_fetch(&mut app, &api, &sender)
+                    }
+                    KeyCode::Char('x') => {
+                        if let Some(snapshot) = app.brief_snapshot.as_ref() {
+                            match export_brief_snapshot(snapshot, &app.brief_related_rss) {
+                                Ok((json_path, txt_path)) => {
+                                    app.status_line = format!(
+                                        "Exported BRIEF to {} and {}",
+                                        json_path.display(),
+                                        txt_path.display()
+                                    );
+                                }
+                                Err(err) => {
+                                    app.status_line = format!("Brief export failed: {}", err);
+                                }
+                            }
+                        } else {
+                            app.status_line = "No BRIEF snapshot to export yet".to_string();
+                        }
+                    }
+                    KeyCode::Char('a') => app.toggle_auto_refresh(),
+                    KeyCode::Char('c') => app.enter_brief_country_editor(),
+                    KeyCode::Char('n') | KeyCode::Right => {
+                        app.cycle_brief_country_next();
+                        start_brief_fetch(&mut app, &api, &sender);
+                    }
+                    KeyCode::Char('p') | KeyCode::Left => {
+                        app.cycle_brief_country_prev();
+                        start_brief_fetch(&mut app, &api, &sender);
+                    }
+                    KeyCode::Up => app.brief_select_prev(),
+                    KeyCode::Down => app.brief_select_next(),
+                    KeyCode::Char('j') => app.brief_scroll_down(),
+                    KeyCode::Char('k') => app.brief_scroll_up(),
+                    KeyCode::Char('u') => app.brief_news_scroll_up(),
+                    KeyCode::Char('d') => app.brief_news_scroll_down(),
+                    _ => {}
+                },
             }
         }
     }
@@ -1111,7 +3250,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let api = ApiClient::new(cli.base_url, cli.api_key, cli.timeout_secs)?;
+    let api = ApiClient::new(cli.base_url, cli.api_key, cli.timeout_secs, cli.api_mode)?;
     let refresh_interval = if cli.auto_refresh_secs > 0 {
         Some(Duration::from_secs(cli.auto_refresh_secs))
     } else {

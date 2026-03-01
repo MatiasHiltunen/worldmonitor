@@ -816,6 +816,7 @@ async fn fetch_energy_prices(
         .collect::<Vec<_>>()
 }
 
+#[cfg(test)]
 fn build_fallback_macro_result() -> GetMacroSignalsResponse {
     GetMacroSignalsResponse {
         timestamp: now_iso(),

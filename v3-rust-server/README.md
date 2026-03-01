@@ -7,6 +7,15 @@ This crate currently provides:
 - Phase A + Phase B route coverage for market/intelligence/infrastructure/economic/conflict/research/prediction.
 - In-memory caching and upstream-backed implementations for shipped routes.
 
+## Library Use
+
+This crate now exports a reusable library surface:
+- `v3_rust_server::build_app` for embedding the Axum router
+- `v3_rust_server::AppState::from_config` for shared state construction
+- `v3_rust_server::in_process::InProcessClient` for direct in-process JSON calls (no TCP socket)
+
+The `v2-rust` TUI uses this in-process client by default.
+
 ## Run
 
 ```bash

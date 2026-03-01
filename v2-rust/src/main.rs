@@ -15,6 +15,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use feed_rs::parser;
+use flow::VersionPackLoader;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -33,6 +34,9 @@ use v3_rust_server::{
     in_process::{InProcessClient, InProcessClientError},
 };
 
+const DEFAULT_CHATJIMMY_PACK_PATH: &str =
+    "/data/data/com.termux/files/home/lega/tui_webflow/packs/chatjimmy_news_single.eon";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "worldmonitor-v2",
@@ -50,6 +54,10 @@ struct Cli {
     timeout_secs: u64,
     #[arg(long, default_value_t = 0)]
     auto_refresh_secs: u64,
+    #[arg(long, env = "WM_BRIEF_PROVIDER", value_enum, default_value_t = BriefIntelProvider::Auto)]
+    brief_provider: BriefIntelProvider,
+    #[arg(long, env = "WM_CHATJIMMY_PACK", default_value = DEFAULT_CHATJIMMY_PACK_PATH)]
+    chatjimmy_pack: String,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -57,6 +65,13 @@ enum ApiMode {
     Library,
     Http,
     Auto,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum BriefIntelProvider {
+    Auto,
+    Server,
+    Chatjimmy,
 }
 
 #[derive(Clone, Copy, Debug, Display, EnumIter, PartialEq, Eq, Hash)]
@@ -330,6 +345,23 @@ fn brief_country_aliases(code: &str) -> &'static [&'static str] {
     }
 }
 
+fn brief_search_terms(country_code: &str, country_name: &str) -> Vec<String> {
+    let mut terms = brief_country_aliases(country_code)
+        .iter()
+        .map(|term| term.to_lowercase())
+        .collect::<Vec<_>>();
+    terms.extend(
+        country_name
+            .split(|ch: char| !ch.is_ascii_alphabetic())
+            .map(str::trim)
+            .filter(|term| term.len() >= 4)
+            .map(|term| term.to_lowercase()),
+    );
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
 fn is_valid_country_code(input: &str) -> bool {
     input.len() == 2 && input.chars().all(|ch| ch.is_ascii_alphabetic())
 }
@@ -416,6 +448,12 @@ struct SettingsCheck {
     note: String,
 }
 
+#[derive(Clone, Debug)]
+struct BriefSourceEvidence {
+    id: String,
+    text: String,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct CountryIntelBriefResponse {
@@ -477,12 +515,90 @@ struct CountryStockIndexResponse {
     currency: String,
 }
 
+#[derive(Clone, Debug)]
+struct ChatJimmyProvider {
+    pack_path: PathBuf,
+    base_url: String,
+    headers: HashMap<String, String>,
+    default_model: String,
+    default_top_k: i64,
+    system_prompt: String,
+}
+
+impl ChatJimmyProvider {
+    fn from_pack(pack_path: impl AsRef<Path>) -> Result<Self> {
+        let pack_path = pack_path.as_ref();
+        let pack = VersionPackLoader::load_dir(pack_path).map_err(|error| {
+            anyhow!(
+                "failed to load ChatJimmy pack {}: {}",
+                pack_path.display(),
+                error
+            )
+        })?;
+        let features = &pack.version.features;
+
+        let default_model = features
+            .get("default_model")
+            .and_then(Value::as_str)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "llama3.1-8B".to_string());
+        let default_top_k = features
+            .get("default_top_k")
+            .and_then(Value::as_i64)
+            .unwrap_or(8)
+            .clamp(1, 64);
+        let system_prompt = features
+            .get("system_prompt")
+            .and_then(Value::as_str)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                "You are a strict JSON API. Always return exactly one valid JSON object."
+                    .to_string()
+            });
+
+        Ok(Self {
+            pack_path: pack_path.to_path_buf(),
+            base_url: pack.version.base_url.trim_end_matches('/').to_string(),
+            headers: pack.version.headers.clone(),
+            default_model,
+            default_top_k,
+            system_prompt,
+        })
+    }
+
+    fn brief_prompt(
+        &self,
+        country_code: &str,
+        country_name: &str,
+        source_text_block: &str,
+    ) -> String {
+        format!(
+            "Return ONLY valid JSON (no markdown, no backticks) with schema: {{\"brief\":\"string\",\"confidence\":0.0,\"used_source_ids\":[\"S1\"],\"insufficient_context\":false}}.\n\
+Task: produce a grounded brief for {} ({}).\n\
+STRICT RULES:\n\
+- Use ONLY the SOURCE TEXT below. Do not use outside knowledge.\n\
+- If a fact is not in SOURCE TEXT, do not mention it.\n\
+- Write 4-8 bullet lines, each ending with one or more citations like [S1] or [S2][S3].\n\
+- If source text is weak, set insufficient_context=true and state missing coverage.\n\
+- Never mention events, dates, actors, or claims not present in sources.\n\
+\n\
+SOURCE TEXT:\n\
+{}",
+            country_name, country_code, source_text_block
+        )
+    }
+}
+
 #[derive(Clone)]
 struct ApiClient {
     base_url: String,
     api_key: Option<String>,
     client: Client,
     transport: ApiTransport,
+    brief_provider: BriefIntelProvider,
+    chatjimmy_pack_path: String,
+    chatjimmy: Option<ChatJimmyProvider>,
+    chatjimmy_init_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -497,6 +613,8 @@ impl ApiClient {
         api_key: Option<String>,
         timeout_secs: u64,
         api_mode: ApiMode,
+        brief_provider: BriefIntelProvider,
+        chatjimmy_pack: String,
     ) -> Result<Self> {
         let normalized_base_url = base_url.trim_end_matches('/').to_string();
         let client = Client::builder()
@@ -521,11 +639,21 @@ impl ApiClient {
             }
         };
 
+        let (chatjimmy, chatjimmy_init_error) = match ChatJimmyProvider::from_pack(&chatjimmy_pack)
+        {
+            Ok(provider) => (Some(provider), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+
         Ok(Self {
             base_url: normalized_base_url,
             api_key,
             client,
             transport,
+            brief_provider,
+            chatjimmy_pack_path: chatjimmy_pack,
+            chatjimmy,
+            chatjimmy_init_error,
         })
     }
 
@@ -637,6 +765,144 @@ impl ApiClient {
         serde_json::from_value(payload).context("failed to decode intelligence brief response")
     }
 
+    fn get_country_intel_brief_chatjimmy(
+        &self,
+        country_code: &str,
+        evidence: &[BriefSourceEvidence],
+    ) -> Result<CountryIntelBriefResponse> {
+        let provider = self.chatjimmy.as_ref().ok_or_else(|| {
+            anyhow!(
+                "{}",
+                self.chatjimmy_init_error
+                    .clone()
+                    .unwrap_or_else(|| "ChatJimmy provider is not configured".to_string())
+            )
+        })?;
+
+        let model = self.resolve_chatjimmy_model(provider)?;
+        let country_name = country_name_from_code(country_code);
+        let source_text_block = render_source_text_block(evidence);
+        if source_text_block.is_empty() {
+            return Err(anyhow!(
+                "ChatJimmy grounded brief requires source text, but none was provided"
+            ));
+        }
+        let prompt = provider.brief_prompt(country_code, country_name.as_str(), &source_text_block);
+        let url = format!("{}/api/chat", provider.base_url);
+
+        let mut request = self
+            .client
+            .post(url)
+            .header("Accept", "text/event-stream")
+            .header("Content-Type", "application/json")
+            .header("Origin", provider.base_url.as_str())
+            .header("Referer", format!("{}/", provider.base_url));
+
+        for (key, value) in &provider.headers {
+            request = request.header(key, value);
+        }
+
+        let response = request
+            .json(&json!({
+                "messages": [{ "role": "user", "content": prompt }],
+                "chatOptions": {
+                    "selectedModel": model,
+                    "systemPrompt": provider.system_prompt,
+                    "topK": provider.default_top_k
+                },
+                "attachment": Value::Null
+            }))
+            .send()
+            .with_context(|| format!("ChatJimmy request failed: {}", provider.base_url))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .context("failed to read ChatJimmy response body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "ChatJimmy HTTP {}: {}",
+                status.as_u16(),
+                truncate_for_error(&body, 220)
+            ));
+        }
+
+        let payload = parse_chatjimmy_payload(body.as_str())?;
+        let raw_brief = payload
+            .get("brief")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("summary").and_then(Value::as_str))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let used_source_ids = payload
+            .get("used_source_ids")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let (brief, model_label) = if brief_is_grounded(&raw_brief, &used_source_ids, evidence) {
+            (raw_brief, format!("chatjimmy/{}", model))
+        } else {
+            (
+                render_grounded_fallback_brief(country_code, country_name.as_str(), evidence),
+                format!("chatjimmy/{}/grounded-fallback", model),
+            )
+        };
+
+        Ok(CountryIntelBriefResponse {
+            country_code: country_code.to_uppercase(),
+            country_name,
+            brief,
+            model: model_label,
+            generated_at: now_epoch_ms(),
+        })
+    }
+
+    fn resolve_chatjimmy_model(&self, provider: &ChatJimmyProvider) -> Result<String> {
+        let url = format!("{}/api/models", provider.base_url);
+        let mut request = self
+            .client
+            .get(url)
+            .header("Accept", "application/json")
+            .header("Referer", format!("{}/", provider.base_url));
+        for (key, value) in &provider.headers {
+            request = request.header(key, value);
+        }
+
+        let response = request.send().with_context(|| {
+            format!("failed to load ChatJimmy models from {}", provider.base_url)
+        })?;
+        let status = response.status();
+        let body = response
+            .text()
+            .context("failed to read ChatJimmy models payload")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "ChatJimmy models probe HTTP {}: {}",
+                status.as_u16(),
+                truncate_for_error(&body, 200)
+            ));
+        }
+
+        let payload: Value = serde_json::from_str(body.as_str())
+            .context("ChatJimmy models response was not valid JSON")?;
+        Ok(payload
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| provider.default_model.clone()))
+    }
+
     fn get_risk_scores(&self, region: &str) -> Result<RiskScoresResponse> {
         let payload = self.post_json_path(
             "/api/intelligence/v1/get-risk-scores",
@@ -666,6 +932,30 @@ impl ApiClient {
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false)
     }
+
+    fn brief_provider_label(&self) -> &'static str {
+        match self.brief_provider {
+            BriefIntelProvider::Auto => "auto(server->chatjimmy)",
+            BriefIntelProvider::Server => "server(groq)",
+            BriefIntelProvider::Chatjimmy => "chatjimmy",
+        }
+    }
+
+    fn chatjimmy_ready(&self) -> bool {
+        self.chatjimmy.is_some()
+    }
+
+    fn chatjimmy_pack_display(&self) -> String {
+        self.chatjimmy_pack_path.clone()
+    }
+
+    fn chatjimmy_status_note(&self) -> String {
+        match (&self.chatjimmy, &self.chatjimmy_init_error) {
+            (Some(provider), _) => format!("Loaded pack: {}", provider.pack_path.display()),
+            (None, Some(error)) => format!("Pack unavailable: {}", truncate_for_error(error, 160)),
+            (None, None) => "Pack unavailable".to_string(),
+        }
+    }
 }
 
 fn looks_like_local_base_url(base_url: &str) -> bool {
@@ -689,8 +979,32 @@ fn any_env_key_present(names: &[&str]) -> bool {
 fn build_settings_checks(api: &ApiClient) -> Vec<SettingsCheck> {
     let remote_http =
         matches!(api.transport, ApiTransport::Http) && !looks_like_local_base_url(&api.base_url);
-    let has_ollama_url = env_key_present("OLLAMA_API_URL");
-    let ollama_ready = has_ollama_url;
+    let ollama_ready = env_key_present("OLLAMA_API_URL");
+    let groq_ready = env_key_present("GROQ_API_KEY");
+    let chatjimmy_ready = api.chatjimmy_ready();
+    let brief_ready = match api.brief_provider {
+        BriefIntelProvider::Server => groq_ready,
+        BriefIntelProvider::Chatjimmy => chatjimmy_ready,
+        BriefIntelProvider::Auto => groq_ready || chatjimmy_ready,
+    };
+    let brief_key_names = match api.brief_provider {
+        BriefIntelProvider::Server => "GROQ_API_KEY",
+        BriefIntelProvider::Chatjimmy => "WM_CHATJIMMY_PACK (or --chatjimmy-pack)",
+        BriefIntelProvider::Auto => "GROQ_API_KEY OR WM_CHATJIMMY_PACK",
+    };
+    let brief_note = match api.brief_provider {
+        BriefIntelProvider::Server => {
+            "Server BRIEF endpoint requires GROQ_API_KEY in rust-server environment.".to_string()
+        }
+        BriefIntelProvider::Chatjimmy => format!(
+            "Grounded-source mode: output limited to provided RSS/risk/stock evidence. {}",
+            api.chatjimmy_status_note()
+        ),
+        BriefIntelProvider::Auto => format!(
+            "Auto mode uses server first, then grounded ChatJimmy fallback. {}",
+            api.chatjimmy_status_note()
+        ),
+    };
 
     vec![
         SettingsCheck {
@@ -705,11 +1019,18 @@ fn build_settings_checks(api: &ApiClient) -> Vec<SettingsCheck> {
             },
         },
         SettingsCheck {
-            capability: "Intel BRIEF model enrichment".to_string(),
-            key_names: "GROQ_API_KEY".to_string(),
+            capability: format!("Intel BRIEF provider ({})", api.brief_provider_label()),
+            key_names: brief_key_names.to_string(),
             required: true,
-            configured: env_key_present("GROQ_API_KEY"),
-            note: "Missing key can return empty/generated fallback brief text.".to_string(),
+            configured: brief_ready,
+            note: brief_note,
+        },
+        SettingsCheck {
+            capability: "ChatJimmy pack availability".to_string(),
+            key_names: "WM_CHATJIMMY_PACK / --chatjimmy-pack".to_string(),
+            required: matches!(api.brief_provider, BriefIntelProvider::Chatjimmy),
+            configured: chatjimmy_ready,
+            note: format!("Pack path: {}", api.chatjimmy_pack_display()),
         },
         SettingsCheck {
             capability: "Conflict ACLED feeds".to_string(),
@@ -759,12 +1080,15 @@ fn build_settings_checks(api: &ApiClient) -> Vec<SettingsCheck> {
         },
         SettingsCheck {
             capability: "News summarization providers".to_string(),
-            key_names: "OLLAMA_API_URL or OPENROUTER_API_KEY or GROQ_API_KEY".to_string(),
+            key_names: "OLLAMA_API_URL or OPENROUTER_API_KEY or GROQ_API_KEY or WM_CHATJIMMY_PACK"
+                .to_string(),
             required: false,
             configured: ollama_ready
                 || env_key_present("OPENROUTER_API_KEY")
-                || env_key_present("GROQ_API_KEY"),
-            note: "Configure one provider for summarize-article endpoint.".to_string(),
+                || groq_ready
+                || chatjimmy_ready,
+            note: "Configure one provider for summarize-article endpoint or BRIEF fallback."
+                .to_string(),
         },
     ]
 }
@@ -815,6 +1139,7 @@ struct App {
     brief_related_selected: usize,
     brief_brief_scroll: u16,
     brief_news_scroll: u16,
+    brief_provider_label: String,
     transport_label: String,
     base_url_display: String,
     settings_checks: Vec<SettingsCheck>,
@@ -919,6 +1244,7 @@ impl App {
             brief_related_selected: 0,
             brief_brief_scroll: 0,
             brief_news_scroll: 0,
+            brief_provider_label: api.brief_provider_label().to_string(),
             transport_label: api.transport_label().to_string(),
             base_url_display: api.base_url.clone(),
             settings_checks,
@@ -1256,20 +1582,10 @@ impl App {
             return;
         };
 
-        let mut terms = brief_country_aliases(snapshot.country_code.as_str())
-            .iter()
-            .map(|term| term.to_lowercase())
-            .collect::<Vec<_>>();
-        terms.extend(
-            snapshot
-                .country_name
-                .split(|ch: char| !ch.is_ascii_alphabetic())
-                .map(str::trim)
-                .filter(|term| term.len() >= 4)
-                .map(|term| term.to_lowercase()),
+        let terms = brief_search_terms(
+            snapshot.country_code.as_str(),
+            snapshot.country_name.as_str(),
         );
-        terms.sort();
-        terms.dedup();
 
         if terms.is_empty() {
             self.brief_related_rss.clear();
@@ -1300,6 +1616,33 @@ impl App {
             self.brief_related_selected = self.brief_related_rss.len() - 1;
         }
         self.brief_news_scroll = 0;
+    }
+
+    fn collect_brief_rss_source_snippets(&self, country_code: &str, limit: usize) -> Vec<String> {
+        let country_name = country_name_from_code(country_code);
+        let terms = brief_search_terms(country_code, country_name.as_str());
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        self.rss_items
+            .iter()
+            .filter(|item| {
+                let haystack = format!("{} {} {}", item.title, item.summary, item.source_name);
+                terms
+                    .iter()
+                    .any(|term| contains_keyword_word(haystack.as_str(), term))
+            })
+            .take(limit)
+            .map(|item| {
+                format!(
+                    "RSS {} | {} | {}",
+                    item.source_name,
+                    item.title,
+                    truncate_for_error(item.summary.as_str(), 220)
+                )
+            })
+            .collect()
     }
 
     fn brief_select_next(&mut self) {
@@ -1980,6 +2323,224 @@ fn now_epoch_ms() -> i64 {
     }
 }
 
+fn parse_chatjimmy_payload(body: &str) -> Result<Value> {
+    let primary = body.split("<|stats|>").next().unwrap_or(body).trim();
+    if !primary.is_empty() {
+        if let Ok(value) = serde_json::from_str::<Value>(primary) {
+            return Ok(value);
+        }
+    }
+
+    if let Some(object) = extract_first_json_object(body) {
+        return serde_json::from_str::<Value>(object)
+            .context("failed to parse extracted ChatJimmy JSON object");
+    }
+
+    Err(anyhow!(
+        "ChatJimmy response did not contain a valid JSON object: {}",
+        truncate_for_error(body, 240)
+    ))
+}
+
+fn extract_first_json_object(input: &str) -> Option<&str> {
+    let bytes = input.as_bytes();
+    let mut start_index: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if start_index.is_none() {
+            if *byte == b'{' {
+                start_index = Some(index);
+                depth = 1;
+            }
+            continue;
+        }
+
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if *byte == b'\\' {
+                escape = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match *byte {
+            b'"' => in_string = true,
+            b'{' => depth = depth.saturating_add(1),
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && let Some(start) = start_index
+                {
+                    return input.get(start..=index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn render_source_text_block(evidence: &[BriefSourceEvidence]) -> String {
+    evidence
+        .iter()
+        .map(|item| format!("[{}] {}", item.id, item.text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_source_ids_from_text(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut ids = Vec::new();
+    let mut index = 0usize;
+    while index + 3 < bytes.len() {
+        if bytes[index] == b'[' && bytes[index + 1] == b'S' {
+            let mut cursor = index + 2;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor > index + 2 && cursor < bytes.len() && bytes[cursor] == b']' {
+                if let Some(value) = text.get(index + 1..cursor) {
+                    ids.push(value.to_string());
+                }
+                index = cursor + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    ids
+}
+
+fn brief_is_grounded(
+    brief: &str,
+    used_source_ids: &[String],
+    evidence: &[BriefSourceEvidence],
+) -> bool {
+    if brief.trim().is_empty() {
+        return false;
+    }
+
+    let allowed_ids = evidence
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<HashSet<_>>();
+    if allowed_ids.is_empty() {
+        return false;
+    }
+
+    let cited_ids = extract_source_ids_from_text(brief);
+    if cited_ids.is_empty() {
+        return false;
+    }
+    if cited_ids
+        .iter()
+        .any(|id| !allowed_ids.contains(id.as_str()))
+    {
+        return false;
+    }
+    if used_source_ids
+        .iter()
+        .any(|id| !allowed_ids.contains(id.as_str()))
+    {
+        return false;
+    }
+
+    let source_corpus = evidence
+        .iter()
+        .map(|item| item.text.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Require every non-empty line to carry at least one citation marker.
+    let mut non_empty_lines = 0usize;
+    for line in brief.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty_lines += 1;
+        if !trimmed.contains("[S") {
+            return false;
+        }
+
+        // Strict overlap check: line content must mostly use tokens present in source text.
+        let content = strip_source_citations(trimmed).to_lowercase();
+        let tokens = content
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|token| token.len() >= 4)
+            .collect::<Vec<_>>();
+        if tokens.is_empty() {
+            return false;
+        }
+        let matched = tokens
+            .iter()
+            .filter(|token| source_corpus.contains(**token))
+            .count();
+        if matched * 2 < tokens.len() {
+            return false;
+        }
+    }
+
+    non_empty_lines > 0
+}
+
+fn strip_source_citations(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut index = 0usize;
+    let bytes = line.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] == b'[' && index + 2 < bytes.len() && bytes[index + 1] == b'S' {
+            let mut cursor = index + 2;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b']' {
+                index = cursor + 1;
+                continue;
+            }
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
+}
+
+fn render_grounded_fallback_brief(
+    country_code: &str,
+    country_name: &str,
+    evidence: &[BriefSourceEvidence],
+) -> String {
+    if evidence.is_empty() {
+        return format!(
+            "- Insufficient source evidence for {} ({}). [S0]",
+            country_name, country_code
+        );
+    }
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "- Grounded summary for {} ({}), limited to provided sources. [{}]",
+        country_name, country_code, evidence[0].id
+    ));
+    for item in evidence.iter().take(7) {
+        lines.push(format!(
+            "- {} [{}]",
+            truncate_for_error(item.text.as_str(), 180),
+            item.id
+        ));
+    }
+    lines.join("\n")
+}
+
 fn strip_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_tag = false;
@@ -2380,7 +2941,23 @@ fn fetch_rss_snapshot(
     }
 }
 
-fn fetch_country_brief_snapshot(api: &ApiClient, country_code: &str) -> BriefSnapshot {
+fn apply_intel_brief(snapshot: &mut BriefSnapshot, intel: CountryIntelBriefResponse) {
+    if !intel.country_code.is_empty() {
+        snapshot.country_code = intel.country_code.to_uppercase();
+    }
+    if !intel.country_name.is_empty() {
+        snapshot.country_name = intel.country_name;
+    }
+    snapshot.intel_brief = intel.brief;
+    snapshot.intel_model = intel.model;
+    snapshot.intel_generated_at = intel.generated_at;
+}
+
+fn fetch_country_brief_snapshot(
+    api: &ApiClient,
+    country_code: &str,
+    rss_source_snippets: Vec<String>,
+) -> BriefSnapshot {
     let normalized_code = country_code.to_uppercase();
     let mut snapshot = BriefSnapshot {
         country_code: normalized_code.clone(),
@@ -2389,28 +2966,19 @@ fn fetch_country_brief_snapshot(api: &ApiClient, country_code: &str) -> BriefSna
         strategic_level: "SEVERITY_LEVEL_UNSPECIFIED".to_string(),
         ..BriefSnapshot::default()
     };
+    let mut evidence = Vec::<BriefSourceEvidence>::new();
+    let mut next_source_id = 1usize;
 
-    match api.get_country_intel_brief(&normalized_code) {
-        Ok(intel) => {
-            if !intel.country_code.is_empty() {
-                snapshot.country_code = intel.country_code.to_uppercase();
-            }
-            if !intel.country_name.is_empty() {
-                snapshot.country_name = intel.country_name;
-            }
-            snapshot.intel_brief = intel.brief;
-            snapshot.intel_model = intel.model;
-            snapshot.intel_generated_at = intel.generated_at;
-            if snapshot.intel_brief.trim().is_empty() {
-                snapshot
-                    .errors
-                    .push("Intel brief unavailable (provider returned empty result)".to_string());
-            }
+    for snippet in rss_source_snippets {
+        let trimmed = snippet.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-        Err(error) => snapshot.errors.push(format!(
-            "Intel brief request failed: {}",
-            format_error_chain(&error, 280)
-        )),
+        evidence.push(BriefSourceEvidence {
+            id: format!("S{}", next_source_id),
+            text: truncate_for_error(trimmed, 300),
+        });
+        next_source_id += 1;
     }
 
     match api.get_risk_scores(snapshot.country_code.as_str()) {
@@ -2424,6 +2992,16 @@ fn fetch_country_brief_snapshot(api: &ApiClient, country_code: &str) -> BriefSna
                 if !cii.trend.is_empty() {
                     snapshot.cii_trend = cii.trend.clone();
                 }
+                evidence.push(BriefSourceEvidence {
+                    id: format!("S{}", next_source_id),
+                    text: format!(
+                        "Risk score source: region={} combined_score={:.1} trend={}.",
+                        cii.region,
+                        cii.combined_score,
+                        compact_enum_label(cii.trend.as_str())
+                    ),
+                });
+                next_source_id += 1;
             } else {
                 snapshot
                     .errors
@@ -2442,9 +3020,19 @@ fn fetch_country_brief_snapshot(api: &ApiClient, country_code: &str) -> BriefSna
                         .iter()
                         .find(|risk| risk.region.eq_ignore_ascii_case("global"))
                 })
-                && !strategic.level.is_empty()
             {
-                snapshot.strategic_level = strategic.level.clone();
+                if !strategic.level.is_empty() {
+                    snapshot.strategic_level = strategic.level.clone();
+                }
+                evidence.push(BriefSourceEvidence {
+                    id: format!("S{}", next_source_id),
+                    text: format!(
+                        "Strategic risk source: region={} level={}.",
+                        strategic.region,
+                        compact_enum_label(strategic.level.as_str())
+                    ),
+                });
+                next_source_id += 1;
             }
         }
         Err(error) => snapshot.errors.push(format!(
@@ -2456,17 +3044,29 @@ fn fetch_country_brief_snapshot(api: &ApiClient, country_code: &str) -> BriefSna
     match api.get_country_stock_index(snapshot.country_code.as_str()) {
         Ok(stock) => {
             snapshot.stock_available = stock.available;
-            snapshot.stock_index_name = stock.index_name;
+            snapshot.stock_index_name = stock.index_name.clone();
             snapshot.stock_price = stock.price;
             snapshot.stock_week_change = stock.week_change_percent;
-            snapshot.stock_currency = stock.currency;
+            snapshot.stock_currency = stock.currency.clone();
             if !stock.code.is_empty() && stock.code != snapshot.country_code {
                 snapshot.errors.push(format!(
                     "Stock endpoint returned mismatched code {}",
                     stock.code
                 ));
             }
-            if !snapshot.stock_available {
+            if snapshot.stock_available {
+                evidence.push(BriefSourceEvidence {
+                    id: format!("S{}", next_source_id),
+                    text: format!(
+                        "Stock source: {} {} {:.2} {} ({:+.2}% 1W).",
+                        stock.code,
+                        stock.index_name,
+                        stock.price,
+                        stock.currency,
+                        stock.week_change_percent
+                    ),
+                });
+            } else {
                 snapshot.errors.push(format!(
                     "No mapped stock index for {}",
                     snapshot.country_code
@@ -2477,6 +3077,70 @@ fn fetch_country_brief_snapshot(api: &ApiClient, country_code: &str) -> BriefSna
             "Stock index request failed: {}",
             format_error_chain(&error, 280)
         )),
+    }
+
+    match api.brief_provider {
+        BriefIntelProvider::Server => match api.get_country_intel_brief(&normalized_code) {
+            Ok(intel) => {
+                apply_intel_brief(&mut snapshot, intel);
+                if snapshot.intel_brief.trim().is_empty() {
+                    snapshot.errors.push(
+                        "Intel brief unavailable from server provider (empty result).".to_string(),
+                    );
+                }
+            }
+            Err(error) => snapshot.errors.push(format!(
+                "Intel brief request failed (server): {}",
+                format_error_chain(&error, 280)
+            )),
+        },
+        BriefIntelProvider::Chatjimmy => {
+            match api.get_country_intel_brief_chatjimmy(&normalized_code, &evidence) {
+                Ok(intel) => apply_intel_brief(&mut snapshot, intel),
+                Err(error) => snapshot.errors.push(format!(
+                    "Intel brief request failed (chatjimmy): {}",
+                    format_error_chain(&error, 280)
+                )),
+            }
+        }
+        BriefIntelProvider::Auto => {
+            let mut should_try_chatjimmy = false;
+            match api.get_country_intel_brief(&normalized_code) {
+                Ok(intel) => {
+                    apply_intel_brief(&mut snapshot, intel);
+                    if snapshot.intel_brief.trim().is_empty() {
+                        should_try_chatjimmy = true;
+                        snapshot.errors.push(
+                            "Server intel provider returned empty brief; trying ChatJimmy fallback."
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    should_try_chatjimmy = true;
+                    snapshot.errors.push(format!(
+                        "Server intel provider failed: {}",
+                        format_error_chain(&error, 220)
+                    ));
+                }
+            }
+
+            if should_try_chatjimmy {
+                match api.get_country_intel_brief_chatjimmy(&normalized_code, &evidence) {
+                    Ok(intel) => apply_intel_brief(&mut snapshot, intel),
+                    Err(error) => snapshot.errors.push(format!(
+                        "ChatJimmy fallback failed: {}",
+                        format_error_chain(&error, 280)
+                    )),
+                }
+            }
+        }
+    }
+
+    if snapshot.intel_brief.trim().is_empty() {
+        snapshot
+            .errors
+            .push("No intel brief provider returned narrative text.".to_string());
     }
 
     snapshot
@@ -2555,13 +3219,19 @@ fn start_brief_fetch(app: &mut App, api: &ApiClient, sender: &Sender<WorkerEvent
 
     app.set_brief_country_code(country_code.clone());
     app.brief_in_flight = true;
-    app.status_line = format!("Generating country brief for {}", country_code);
+    app.status_line = format!(
+        "Generating country brief for {} via {}",
+        country_code,
+        api.brief_provider_label()
+    );
 
+    let rss_source_snippets = app.collect_brief_rss_source_snippets(country_code.as_str(), 10);
     let api = api.clone();
     let sender = sender.clone();
     thread::spawn(move || {
         let started = Instant::now();
-        let snapshot = fetch_country_brief_snapshot(&api, country_code.as_str());
+        let snapshot =
+            fetch_country_brief_snapshot(&api, country_code.as_str(), rss_source_snippets);
         let _ = sender.send(WorkerEvent::BriefSuccess {
             snapshot,
             duration_ms: started.elapsed().as_millis(),
@@ -2642,9 +3312,15 @@ fn apply_worker_events(app: &mut App, receiver: &Receiver<WorkerEvent>) {
                 let all_core_sections_missing = snapshot.intel_brief.trim().is_empty()
                     && snapshot.cii_score.is_none()
                     && !snapshot.stock_available;
+                let intel_source = if snapshot.intel_model.trim().is_empty() {
+                    "unknown".to_string()
+                } else {
+                    snapshot.intel_model.clone()
+                };
                 app.brief_last_fetch_summary = format!(
-                    "{} | {} warnings | {}ms",
+                    "{} | {} | {} warnings | {}ms",
                     snapshot.country_code,
+                    intel_source,
                     snapshot.errors.len(),
                     duration_ms
                 );
@@ -3318,6 +3994,15 @@ fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::R
     let intel_age = snapshot
         .map(|snap| format_age(snap.intel_generated_at))
         .unwrap_or_else(|| "unknown".to_string());
+    let provider_label = snapshot
+        .map(|snap| {
+            if snap.intel_model.trim().is_empty() {
+                app.brief_provider_label.clone()
+            } else {
+                snap.intel_model.clone()
+            }
+        })
+        .unwrap_or_else(|| app.brief_provider_label.clone());
 
     let warning_lines = snapshot
         .map(|snap| {
@@ -3379,6 +4064,10 @@ fn draw_brief_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::R
         Line::from(vec![
             Span::styled("Intel age ", Style::default().fg(Color::DarkGray)),
             Span::styled(intel_age, Style::default().fg(Color::LightBlue)),
+        ]),
+        Line::from(vec![
+            Span::styled("Provider ", Style::default().fg(Color::DarkGray)),
+            Span::styled(provider_label, Style::default().fg(Color::LightMagenta)),
         ]),
         Line::from(vec![
             Span::styled("Related RSS ", Style::default().fg(Color::DarkGray)),
@@ -3918,7 +4607,14 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let api = ApiClient::new(cli.base_url, cli.api_key, cli.timeout_secs, cli.api_mode)?;
+    let api = ApiClient::new(
+        cli.base_url,
+        cli.api_key,
+        cli.timeout_secs,
+        cli.api_mode,
+        cli.brief_provider,
+        cli.chatjimmy_pack,
+    )?;
     let refresh_interval = if cli.auto_refresh_secs > 0 {
         Some(Duration::from_secs(cli.auto_refresh_secs))
     } else {
@@ -3932,4 +4628,65 @@ fn main() -> Result<()> {
     run_result?;
     restore_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BriefSourceEvidence, brief_is_grounded, extract_first_json_object, parse_chatjimmy_payload,
+        strip_source_citations,
+    };
+
+    #[test]
+    fn parse_chatjimmy_payload_accepts_stats_suffix() {
+        let body = r#"{"brief":"Signal stable","confidence":0.77}
+<|stats|>{"decode_tokens":12}<|/stats|>"#;
+        let payload = parse_chatjimmy_payload(body).expect("payload should parse");
+        assert_eq!(payload["brief"], "Signal stable");
+    }
+
+    #[test]
+    fn extract_first_json_object_finds_embedded_object() {
+        let body = "prefix\n{\"brief\":\"Nested\",\"watch_items\":[\"A\",\"B\"]}\ntrailer";
+        let object = extract_first_json_object(body).expect("object expected");
+        assert!(object.contains("\"watch_items\""));
+    }
+
+    #[test]
+    fn grounded_brief_requires_valid_source_citations() {
+        let evidence = vec![
+            BriefSourceEvidence {
+                id: "S1".to_string(),
+                text: "Risk trend is rising in the latest report.".to_string(),
+            },
+            BriefSourceEvidence {
+                id: "S2".to_string(),
+                text: "Signal remains stable in the latest feed.".to_string(),
+            },
+        ];
+        let grounded =
+            "- Signal remains stable in the latest feed. [S2]\n- Risk trend is rising. [S1]";
+        assert!(brief_is_grounded(
+            grounded,
+            &["S1".to_string(), "S2".to_string()],
+            &evidence
+        ));
+        let ungrounded = "- Signal remains stable in the latest feed.";
+        assert!(!brief_is_grounded(ungrounded, &[], &evidence));
+        let invalid_source = "- New claim. [S9]";
+        assert!(!brief_is_grounded(
+            invalid_source,
+            &["S9".to_string()],
+            &evidence
+        ));
+    }
+
+    #[test]
+    fn strip_source_citations_removes_tags() {
+        let line = "- Risk moved higher from latest report. [S1][S2]";
+        assert_eq!(
+            strip_source_citations(line),
+            "- Risk moved higher from latest report. "
+        );
+    }
 }

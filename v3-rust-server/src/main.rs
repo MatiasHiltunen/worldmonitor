@@ -433,4 +433,123 @@ mod tests {
             .expect("route response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn aviation_endpoint_returns_alerts_contract() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/aviation/v1/list-airport-delays")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"region":"AIRPORT_REGION_UNSPECIFIED","minSeverity":"FLIGHT_DELAY_SEVERITY_UNSPECIFIED"}"#,
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("alerts").is_some());
+    }
+
+    #[tokio::test]
+    async fn displacement_population_exposure_contract_is_available() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/displacement/v1/get-population-exposure")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"mode":"countries"}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["success"], true);
+        assert!(payload.get("countries").is_some());
+    }
+
+    #[tokio::test]
+    async fn maritime_snapshot_endpoint_returns_optional_snapshot_shape() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/maritime/v1/get-vessel-snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("build request"),
+        )
+        .await
+        .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.is_object());
+    }
+
+    #[tokio::test]
+    async fn military_wingbits_status_endpoint_returns_configured_flag() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/military/v1/get-wingbits-status")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("configured").is_some());
+    }
+
+    #[tokio::test]
+    async fn news_summarize_endpoint_skips_unknown_provider() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/news/v1/summarize-article")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"provider":"unknown","headlines":["Signal update"],"mode":"brief","geoContext":"","variant":"full","lang":"en"}"#,
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["skipped"], true);
+    }
+
+    #[tokio::test]
+    async fn wildfire_endpoint_without_api_key_returns_empty_payload() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wildfire/v1/list-fire-detections")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["fireDetections"], serde_json::json!([]));
+    }
 }

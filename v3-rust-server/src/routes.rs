@@ -9,8 +9,9 @@ use serde::Serialize;
 use crate::{
     AppState,
     domains::{
-        conflict, economic, infrastructure, infrastructure_ops, intelligence, market, prediction,
-        research, seismology, unrest,
+        aviation, climate, conflict, cyber, displacement, economic, infrastructure,
+        infrastructure_ops, intelligence, maritime, market, military, news, prediction, research,
+        seismology, unrest, wildfire,
     },
 };
 
@@ -48,6 +49,26 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         // Phase A routes needed for Rust TUI + core parity harness.
+        .route(
+            "/api/aviation/v1/list-airport-delays",
+            post(aviation::list_airport_delays),
+        )
+        .route(
+            "/api/climate/v1/list-climate-anomalies",
+            post(climate::list_climate_anomalies),
+        )
+        .route(
+            "/api/cyber/v1/list-cyber-threats",
+            post(cyber::list_cyber_threats),
+        )
+        .route(
+            "/api/displacement/v1/get-displacement-summary",
+            post(displacement::get_displacement_summary),
+        )
+        .route(
+            "/api/displacement/v1/get-population-exposure",
+            post(displacement::get_population_exposure),
+        )
         .route(
             "/api/intelligence/v1/get-country-intel-brief",
             post(intelligence::get_country_intel_brief),
@@ -171,6 +192,46 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/research/v1/list-tech-events",
             post(research::list_tech_events),
+        )
+        .route(
+            "/api/maritime/v1/get-vessel-snapshot",
+            post(maritime::get_vessel_snapshot),
+        )
+        .route(
+            "/api/maritime/v1/list-navigational-warnings",
+            post(maritime::list_navigational_warnings),
+        )
+        .route(
+            "/api/military/v1/list-military-flights",
+            post(military::list_military_flights),
+        )
+        .route(
+            "/api/military/v1/get-theater-posture",
+            post(military::get_theater_posture),
+        )
+        .route(
+            "/api/military/v1/get-aircraft-details",
+            post(military::get_aircraft_details),
+        )
+        .route(
+            "/api/military/v1/get-aircraft-details-batch",
+            post(military::get_aircraft_details_batch),
+        )
+        .route(
+            "/api/military/v1/get-wingbits-status",
+            post(military::get_wingbits_status),
+        )
+        .route(
+            "/api/military/v1/get-usni-fleet-report",
+            post(military::get_usni_fleet_report),
+        )
+        .route(
+            "/api/news/v1/summarize-article",
+            post(news::summarize_article),
+        )
+        .route(
+            "/api/wildfire/v1/list-fire-detections",
+            post(wildfire::list_fire_detections),
         )
         .fallback(not_found)
         .with_state(state)

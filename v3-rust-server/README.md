@@ -4,7 +4,7 @@ Rust-native server migration target for WorldMonitor API parity.
 
 This crate currently provides:
 - Gateway middleware scaffold (CORS + API-key checks).
-- Phase A + Phase B route coverage for market/intelligence/infrastructure/economic/conflict/research/prediction.
+- Phase A + B + C route coverage, including aviation/climate/cyber/displacement/maritime/military/news/wildfire.
 - In-memory caching and upstream-backed implementations for shipped routes.
 
 ## Library Use
@@ -41,6 +41,11 @@ WM_SERVER_ADDR=127.0.0.1:8787 cargo run
 - `FINNHUB_API_KEY` (market quote enrichment)
 - `FRED_API_KEY` (economic FRED series)
 - `EIA_API_KEY` (economic energy prices)
+- `WS_RELAY_URL` / `LOCAL_API_MODE` (maritime + military relay/OpenSky paths)
+- `WINGBITS_API_KEY` (military aircraft enrichment)
+- `OLLAMA_API_URL` / `OLLAMA_API_KEY` / `OLLAMA_MODEL` (news summarization)
+- `OPENROUTER_API_KEY` (news summarization)
+- `NASA_FIRMS_API_KEY` / `FIRMS_API_KEY` (wildfire detections)
 
 ## Implemented Route Surface
 
@@ -49,6 +54,11 @@ WM_SERVER_ADDR=127.0.0.1:8787 cargo run
 - `POST /api/intelligence/v1/classify-event`
 - `POST /api/intelligence/v1/search-gdelt-documents`
 - `POST /api/intelligence/v1/get-risk-scores`
+- `POST /api/aviation/v1/list-airport-delays`
+- `POST /api/climate/v1/list-climate-anomalies`
+- `POST /api/cyber/v1/list-cyber-threats`
+- `POST /api/displacement/v1/get-displacement-summary`
+- `POST /api/displacement/v1/get-population-exposure`
 - `POST /api/market/v1/get-country-stock-index`
 - `POST /api/market/v1/list-market-quotes`
 - `POST /api/market/v1/list-commodity-quotes`
@@ -75,6 +85,16 @@ WM_SERVER_ADDR=127.0.0.1:8787 cargo run
 - `POST /api/research/v1/list-hackernews-items`
 - `POST /api/research/v1/list-tech-events`
 - `POST /api/prediction/v1/list-prediction-markets`
+- `POST /api/maritime/v1/get-vessel-snapshot`
+- `POST /api/maritime/v1/list-navigational-warnings`
+- `POST /api/military/v1/list-military-flights`
+- `POST /api/military/v1/get-theater-posture`
+- `POST /api/military/v1/get-aircraft-details`
+- `POST /api/military/v1/get-aircraft-details-batch`
+- `POST /api/military/v1/get-wingbits-status`
+- `POST /api/military/v1/get-usni-fleet-report`
+- `POST /api/news/v1/summarize-article`
+- `POST /api/wildfire/v1/list-fire-detections`
 - `GET /healthz`
 
 See [ROADMAP.md](/data/data/com.termux/files/home/worldmonitor/v3-rust-server/ROADMAP.md) for migration phases and done criteria.

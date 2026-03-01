@@ -54,8 +54,16 @@ pub fn build_router(state: AppState) -> Router {
             post(aviation::list_airport_delays),
         )
         .route(
+            "/api/aviation/v1/get-flight-radar",
+            post(aviation::get_flight_radar),
+        )
+        .route(
             "/api/climate/v1/list-climate-anomalies",
             post(climate::list_climate_anomalies),
+        )
+        .route(
+            "/api/climate/v1/get-global-radiation-situation",
+            post(climate::get_global_radiation_situation),
         )
         .route(
             "/api/cyber/v1/list-cyber-threats",
@@ -196,6 +204,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/maritime/v1/get-vessel-snapshot",
             post(maritime::get_vessel_snapshot),
+        )
+        .route(
+            "/api/maritime/v1/get-marine-traffic",
+            post(maritime::get_marine_traffic),
         )
         .route(
             "/api/maritime/v1/list-navigational-warnings",

@@ -15,6 +15,7 @@ use crate::{AppState, error::AppError};
 
 const SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(10);
 const WARNINGS_CACHE_TTL: Duration = Duration::from_secs(3_600);
+const MARINE_TRAFFIC_CACHE_TTL: Duration = Duration::from_secs(30);
 const NGA_WARNINGS_URL: &str =
     "https://msi.nga.mil/api/publications/broadcast-warn?output=json&status=A";
 
@@ -23,6 +24,15 @@ const NGA_WARNINGS_URL: &str =
 pub struct GetVesselSnapshotRequest {
     #[serde(default)]
     pub bounding_box: Option<BoundingBox>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMarineTrafficRequest {
+    #[serde(default)]
+    pub pagination: Option<PaginationRequest>,
+    #[serde(default)]
+    pub area: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -46,6 +56,20 @@ pub struct GeoCoordinates {
 pub struct GetVesselSnapshotResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<VesselSnapshot>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMarineTrafficResponse {
+    pub snapshot_at: i64,
+    pub source: String,
+    pub ais_available: bool,
+    pub warnings_available: bool,
+    pub density_zones: Vec<AisDensityZone>,
+    pub disruptions: Vec<AisDisruption>,
+    pub warnings: Vec<NavigationalWarning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<PaginationResponse>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -146,8 +170,16 @@ struct WarningsCacheEntry {
     expires_at: Instant,
 }
 
+#[derive(Clone)]
+struct MarineTrafficCacheEntry {
+    value: GetMarineTrafficResponse,
+    expires_at: Instant,
+}
+
 static SNAPSHOT_CACHE: Lazy<Mutex<Option<SnapshotCacheEntry>>> = Lazy::new(|| Mutex::new(None));
 static WARNINGS_CACHE: Lazy<Mutex<HashMap<String, WarningsCacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static MARINE_TRAFFIC_CACHE: Lazy<Mutex<HashMap<String, MarineTrafficCacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn now_epoch_ms() -> i64 {
@@ -391,6 +423,16 @@ fn warning_page_size(request: &ListNavigationalWarningsRequest) -> usize {
         .min(1_000)
 }
 
+fn marine_page_size(request: &GetMarineTrafficRequest) -> usize {
+    request
+        .pagination
+        .as_ref()
+        .map(|pagination| pagination.page_size)
+        .filter(|size| *size > 0)
+        .unwrap_or(100)
+        .min(1_000)
+}
+
 fn get_warnings_cache(key: &str) -> Result<Option<ListNavigationalWarningsResponse>, AppError> {
     let cache = WARNINGS_CACHE
         .lock()
@@ -415,6 +457,32 @@ fn set_warnings_cache(
         WarningsCacheEntry {
             value: value.clone(),
             expires_at: Instant::now() + WARNINGS_CACHE_TTL,
+        },
+    );
+    Ok(())
+}
+
+fn get_marine_traffic_cache(key: &str) -> Result<Option<GetMarineTrafficResponse>, AppError> {
+    let cache = MARINE_TRAFFIC_CACHE
+        .lock()
+        .map_err(|_| AppError::Internal("marine traffic cache lock poisoned".to_string()))?;
+    if let Some(entry) = cache.get(key)
+        && Instant::now() <= entry.expires_at
+    {
+        return Ok(Some(entry.value.clone()));
+    }
+    Ok(None)
+}
+
+fn set_marine_traffic_cache(key: String, value: &GetMarineTrafficResponse) -> Result<(), AppError> {
+    let mut cache = MARINE_TRAFFIC_CACHE
+        .lock()
+        .map_err(|_| AppError::Internal("marine traffic cache lock poisoned".to_string()))?;
+    cache.insert(
+        key,
+        MarineTrafficCacheEntry {
+            value: value.clone(),
+            expires_at: Instant::now() + MARINE_TRAFFIC_CACHE_TTL,
         },
     );
     Ok(())
@@ -488,16 +556,20 @@ async fn fetch_nga_warnings(state: &AppState, area: &str) -> Vec<NavigationalWar
     warnings
 }
 
+async fn resolve_vessel_snapshot(state: &AppState) -> Result<Option<VesselSnapshot>, AppError> {
+    if let Some(cached) = get_snapshot_cache()? {
+        return Ok(cached);
+    }
+    let snapshot = fetch_snapshot_from_relay(state).await;
+    set_snapshot_cache(&snapshot)?;
+    Ok(snapshot)
+}
+
 pub async fn get_vessel_snapshot(
     State(state): State<AppState>,
     Json(_request): Json<GetVesselSnapshotRequest>,
 ) -> Result<Json<GetVesselSnapshotResponse>, AppError> {
-    if let Some(cached) = get_snapshot_cache()? {
-        return Ok(Json(GetVesselSnapshotResponse { snapshot: cached }));
-    }
-
-    let snapshot = fetch_snapshot_from_relay(&state).await;
-    set_snapshot_cache(&snapshot)?;
+    let snapshot = resolve_vessel_snapshot(&state).await?;
     Ok(Json(GetVesselSnapshotResponse { snapshot }))
 }
 
@@ -506,11 +578,13 @@ pub async fn list_navigational_warnings(
     Json(request): Json<ListNavigationalWarningsRequest>,
 ) -> Result<Json<ListNavigationalWarningsResponse>, AppError> {
     let area = request.area.trim().to_string();
-    let cache_key = if area.is_empty() {
+    let page_size = warning_page_size(&request);
+    let area_key = if area.is_empty() {
         "all".to_string()
     } else {
         area.to_ascii_lowercase()
     };
+    let cache_key = format!("{area_key}:{page_size}");
 
     if let Some(cached) = get_warnings_cache(&cache_key)? {
         return Ok(Json(cached));
@@ -518,7 +592,7 @@ pub async fn list_navigational_warnings(
 
     let mut warnings = fetch_nga_warnings(&state, &area).await;
     let total_count = warnings.len();
-    warnings.truncate(warning_page_size(&request));
+    warnings.truncate(page_size);
 
     let response = ListNavigationalWarningsResponse {
         warnings,
@@ -531,5 +605,61 @@ pub async fn list_navigational_warnings(
     if !response.warnings.is_empty() {
         set_warnings_cache(cache_key, &response)?;
     }
+    Ok(Json(response))
+}
+
+pub async fn get_marine_traffic(
+    State(state): State<AppState>,
+    Json(request): Json<GetMarineTrafficRequest>,
+) -> Result<Json<GetMarineTrafficResponse>, AppError> {
+    let area = request.area.trim().to_string();
+    let page_size = marine_page_size(&request);
+    let area_key = if area.is_empty() {
+        "all".to_string()
+    } else {
+        area.to_ascii_lowercase()
+    };
+    let cache_key = format!("{area_key}:{page_size}");
+    if let Some(cached) = get_marine_traffic_cache(&cache_key)? {
+        return Ok(Json(cached));
+    }
+
+    let snapshot = resolve_vessel_snapshot(&state).await?;
+    let mut warnings = fetch_nga_warnings(&state, &area).await;
+    let warning_count = warnings.len();
+    warnings.truncate(page_size);
+
+    let (snapshot_at, density_zones, disruptions) = match snapshot {
+        Some(snapshot) => (
+            snapshot.snapshot_at,
+            snapshot.density_zones,
+            snapshot.disruptions,
+        ),
+        None => (now_epoch_ms(), Vec::new(), Vec::new()),
+    };
+    let density_count = density_zones.len();
+    let disruption_count = disruptions.len();
+
+    let response = GetMarineTrafficResponse {
+        snapshot_at,
+        source: if density_count > 0 || disruption_count > 0 {
+            "MARINE_TRAFFIC_SOURCE_AIS_AND_NGA".to_string()
+        } else if warning_count > 0 {
+            "MARINE_TRAFFIC_SOURCE_NGA".to_string()
+        } else {
+            "MARINE_TRAFFIC_SOURCE_UNAVAILABLE".to_string()
+        },
+        ais_available: density_count > 0 || disruption_count > 0,
+        warnings_available: warning_count > 0,
+        density_zones,
+        disruptions,
+        warnings,
+        pagination: Some(PaginationResponse {
+            next_cursor: String::new(),
+            total_count: density_count + disruption_count + warning_count,
+        }),
+    };
+
+    set_marine_traffic_cache(cache_key, &response)?;
     Ok(Json(response))
 }

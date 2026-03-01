@@ -456,6 +456,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flight_radar_endpoint_returns_contract_shape() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/aviation/v1/get-flight-radar")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"includeGround":false}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("source").is_some());
+        assert!(payload.get("flights").is_some());
+    }
+
+    #[tokio::test]
+    async fn radiation_endpoint_returns_contract_shape() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/climate/v1/get-global-radiation-situation")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("source").is_some());
+        assert!(payload.get("entries").is_some());
+    }
+
+    #[tokio::test]
     async fn displacement_population_exposure_contract_is_available() {
         let app = test_app();
         let response = app
@@ -492,6 +532,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert!(payload.is_object());
+    }
+
+    #[tokio::test]
+    async fn marine_traffic_endpoint_returns_contract_shape() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/maritime/v1/get-marine-traffic")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"area":""}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("source").is_some());
+        assert!(payload.get("warnings").is_some());
     }
 
     #[tokio::test]

@@ -18,6 +18,9 @@ Rust-first terminal client for WorldMonitor APIs using `ratatui`.
   - `unrest/list-unrest-events`
   - `infrastructure/list-service-statuses`
   - `market/list-crypto-quotes`
+  - `climate/get-global-radiation-situation`
+  - `aviation/get-flight-radar`
+  - `maritime/get-marine-traffic`
   - `intelligence/get-country-intel-brief`
   - `intelligence/get-risk-scores`
   - `market/get-country-stock-index`

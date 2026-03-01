@@ -55,7 +55,9 @@ WM_SERVER_ADDR=127.0.0.1:8787 cargo run
 - `POST /api/intelligence/v1/search-gdelt-documents`
 - `POST /api/intelligence/v1/get-risk-scores`
 - `POST /api/aviation/v1/list-airport-delays`
+- `POST /api/aviation/v1/get-flight-radar`
 - `POST /api/climate/v1/list-climate-anomalies`
+- `POST /api/climate/v1/get-global-radiation-situation`
 - `POST /api/cyber/v1/list-cyber-threats`
 - `POST /api/displacement/v1/get-displacement-summary`
 - `POST /api/displacement/v1/get-population-exposure`
@@ -86,6 +88,7 @@ WM_SERVER_ADDR=127.0.0.1:8787 cargo run
 - `POST /api/research/v1/list-tech-events`
 - `POST /api/prediction/v1/list-prediction-markets`
 - `POST /api/maritime/v1/get-vessel-snapshot`
+- `POST /api/maritime/v1/get-marine-traffic`
 - `POST /api/maritime/v1/list-navigational-warnings`
 - `POST /api/military/v1/list-military-flights`
 - `POST /api/military/v1/get-theater-posture`

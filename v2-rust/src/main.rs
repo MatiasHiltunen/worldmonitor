@@ -96,6 +96,12 @@ enum Endpoint {
     InfrastructureStatuses,
     #[strum(to_string = "Market: List Crypto Quotes")]
     MarketCryptoQuotes,
+    #[strum(to_string = "Climate: Global Radiation Situation")]
+    ClimateGlobalRadiationSituation,
+    #[strum(to_string = "Aviation: Flight Radar")]
+    AviationFlightRadar,
+    #[strum(to_string = "Maritime: Marine Traffic")]
+    MaritimeMarineTraffic,
 }
 
 impl Endpoint {
@@ -105,6 +111,11 @@ impl Endpoint {
             Endpoint::UnrestEvents => "/api/unrest/v1/list-unrest-events",
             Endpoint::InfrastructureStatuses => "/api/infrastructure/v1/list-service-statuses",
             Endpoint::MarketCryptoQuotes => "/api/market/v1/list-crypto-quotes",
+            Endpoint::ClimateGlobalRadiationSituation => {
+                "/api/climate/v1/get-global-radiation-situation"
+            }
+            Endpoint::AviationFlightRadar => "/api/aviation/v1/get-flight-radar",
+            Endpoint::MaritimeMarineTraffic => "/api/maritime/v1/get-marine-traffic",
         }
     }
 
@@ -133,6 +144,24 @@ impl Endpoint {
                     "ids": ["bitcoin", "ethereum", "solana", "xrp", "dogecoin"]
                 })
             }
+            Endpoint::ClimateGlobalRadiationSituation => {
+                json!({
+                    "minSeverity": "RADIATION_SEVERITY_UNSPECIFIED",
+                    "pagination": { "pageSize": 20, "cursor": "" }
+                })
+            }
+            Endpoint::AviationFlightRadar => {
+                json!({
+                    "includeGround": false,
+                    "pagination": { "pageSize": 30, "cursor": "" }
+                })
+            }
+            Endpoint::MaritimeMarineTraffic => {
+                json!({
+                    "area": "",
+                    "pagination": { "pageSize": 20, "cursor": "" }
+                })
+            }
         }
     }
 
@@ -142,6 +171,9 @@ impl Endpoint {
             Endpoint::UnrestEvents => "UnrestService.openapi.json",
             Endpoint::InfrastructureStatuses => "InfrastructureService.openapi.json",
             Endpoint::MarketCryptoQuotes => "MarketService.openapi.json",
+            Endpoint::ClimateGlobalRadiationSituation => "ClimateService.openapi.json",
+            Endpoint::AviationFlightRadar => "AviationService.openapi.json",
+            Endpoint::MaritimeMarineTraffic => "MaritimeService.openapi.json",
         }
     }
 }
@@ -2711,6 +2743,9 @@ fn format_payload(endpoint: Endpoint, payload: Value) -> Result<Vec<String>> {
         Endpoint::UnrestEvents => format_unrest(payload),
         Endpoint::InfrastructureStatuses => format_service_status(payload),
         Endpoint::MarketCryptoQuotes => format_crypto_quotes(payload),
+        Endpoint::ClimateGlobalRadiationSituation => format_global_radiation(payload),
+        Endpoint::AviationFlightRadar => format_flight_radar(payload),
+        Endpoint::MaritimeMarineTraffic => format_marine_traffic(payload),
     }
 }
 
@@ -2921,6 +2956,273 @@ fn format_crypto_quotes(payload: Value) -> Result<Vec<String>> {
             quote.change
         ));
     }
+    Ok(lines)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlobalRadiationResponse {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    entries: Vec<GlobalRadiationEntry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GlobalRadiationEntry {
+    #[serde(default)]
+    zone: String,
+    #[serde(default)]
+    shortwave_radiation_wm2: f64,
+    #[serde(default)]
+    uv_index: f64,
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    trend: String,
+}
+
+fn format_global_radiation(payload: Value) -> Result<Vec<String>> {
+    let response: GlobalRadiationResponse =
+        serde_json::from_value(payload).context("failed to decode climate radiation response")?;
+    if response.entries.is_empty() {
+        return Ok(vec![
+            "No global radiation observations returned.".to_string(),
+            "Tip: retry in a few seconds if upstream weather API is rate-limited.".to_string(),
+        ]);
+    }
+
+    let mut lines = vec![
+        format!(
+            "Global radiation zones: {} (source: {})",
+            response.entries.len(),
+            if response.source.trim().is_empty() {
+                "unknown"
+            } else {
+                response.source.as_str()
+            }
+        ),
+        String::new(),
+    ];
+    for entry in response.entries.iter().take(40) {
+        lines.push(format!(
+            "{:<9} | UV {:>4.1} | {:>6.1} W/m^2 | {:<18} | {}",
+            compact_enum_label(&entry.severity),
+            entry.uv_index,
+            entry.shortwave_radiation_wm2,
+            entry.zone,
+            compact_enum_label(&entry.trend)
+        ));
+    }
+    Ok(lines)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FlightRadarResponse {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    flights: Vec<FlightRadarTrack>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct FlightRadarTrack {
+    #[serde(default)]
+    callsign: String,
+    #[serde(default)]
+    icao24: String,
+    #[serde(default)]
+    origin_country: String,
+    #[serde(default)]
+    altitude_m: f64,
+    #[serde(default)]
+    speed_mps: f64,
+    #[serde(default)]
+    on_ground: bool,
+}
+
+fn format_flight_radar(payload: Value) -> Result<Vec<String>> {
+    let response: FlightRadarResponse =
+        serde_json::from_value(payload).context("failed to decode flight radar response")?;
+    if response.flights.is_empty() {
+        return Ok(vec![
+            "No flight radar tracks returned.".to_string(),
+            format!(
+                "Source: {}",
+                if response.source.trim().is_empty() {
+                    "unknown"
+                } else {
+                    response.source.as_str()
+                }
+            ),
+        ]);
+    }
+
+    let mut lines = vec![
+        format!(
+            "Flight radar tracks: {} (source: {})",
+            response.flights.len(),
+            if response.source.trim().is_empty() {
+                "unknown"
+            } else {
+                response.source.as_str()
+            }
+        ),
+        String::new(),
+    ];
+    for flight in response.flights.iter().take(50) {
+        let label = if flight.callsign.trim().is_empty() {
+            flight.icao24.to_ascii_uppercase()
+        } else {
+            flight.callsign.trim().to_string()
+        };
+        lines.push(format!(
+            "{:<10} | {:<16} | {:>6.0} m | {:>5.0} m/s | {}",
+            label,
+            flight.origin_country,
+            flight.altitude_m,
+            flight.speed_mps,
+            if flight.on_ground { "GROUND" } else { "AIR" }
+        ));
+    }
+    Ok(lines)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarineTrafficResponse {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    ais_available: bool,
+    #[serde(default)]
+    warnings_available: bool,
+    #[serde(default)]
+    density_zones: Vec<MarineDensityZone>,
+    #[serde(default)]
+    disruptions: Vec<MarineDisruption>,
+    #[serde(default)]
+    warnings: Vec<MarineWarning>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MarineDensityZone {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    ships_per_day: f64,
+    #[serde(default)]
+    intensity: f64,
+    #[serde(default)]
+    delta_pct: f64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MarineDisruption {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    change_pct: f64,
+    #[serde(default)]
+    region: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MarineWarning {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    area: String,
+}
+
+fn format_marine_traffic(payload: Value) -> Result<Vec<String>> {
+    let response: MarineTrafficResponse =
+        serde_json::from_value(payload).context("failed to decode marine traffic response")?;
+    if response.density_zones.is_empty()
+        && response.disruptions.is_empty()
+        && response.warnings.is_empty()
+    {
+        return Ok(vec![
+            "No marine traffic data returned.".to_string(),
+            format!(
+                "Source: {}",
+                if response.source.trim().is_empty() {
+                    "unknown"
+                } else {
+                    response.source.as_str()
+                }
+            ),
+        ]);
+    }
+
+    let mut lines = vec![
+        format!(
+            "Marine traffic: {} density zones | {} disruptions | {} warnings",
+            response.density_zones.len(),
+            response.disruptions.len(),
+            response.warnings.len()
+        ),
+        format!(
+            "Source: {} | AIS: {} | NGA warnings: {}",
+            if response.source.trim().is_empty() {
+                "unknown"
+            } else {
+                response.source.as_str()
+            },
+            if response.ais_available { "yes" } else { "no" },
+            if response.warnings_available {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        String::new(),
+    ];
+
+    if !response.density_zones.is_empty() {
+        lines.push("Top density zones:".to_string());
+        for zone in response.density_zones.iter().take(8) {
+            lines.push(format!(
+                "  {:<24} | {:>7.1} ships/day | intensity {:>4.1} | delta {:+5.1}%",
+                zone.name, zone.ships_per_day, zone.intensity, zone.delta_pct
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !response.disruptions.is_empty() {
+        lines.push("Active disruptions:".to_string());
+        for disruption in response.disruptions.iter().take(8) {
+            lines.push(format!(
+                "  {:<24} | {:<9} | {:+6.1}% | {}",
+                disruption.name,
+                compact_enum_label(&disruption.severity),
+                disruption.change_pct,
+                disruption.region
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !response.warnings.is_empty() {
+        lines.push("Latest navigational warnings:".to_string());
+        for warning in response.warnings.iter().take(8) {
+            lines.push(format!(
+                "  {:<14} | {}",
+                warning.area,
+                truncate_for_error(&warning.title, 90)
+            ));
+        }
+    }
+
     Ok(lines)
 }
 
@@ -5069,6 +5371,9 @@ fn endpoint_style(endpoint: Endpoint) -> Style {
         Endpoint::UnrestEvents => Style::default().fg(Color::LightRed),
         Endpoint::InfrastructureStatuses => Style::default().fg(Color::LightCyan),
         Endpoint::MarketCryptoQuotes => Style::default().fg(Color::LightGreen),
+        Endpoint::ClimateGlobalRadiationSituation => Style::default().fg(Color::Yellow),
+        Endpoint::AviationFlightRadar => Style::default().fg(Color::LightBlue),
+        Endpoint::MaritimeMarineTraffic => Style::default().fg(Color::Cyan),
     }
 }
 

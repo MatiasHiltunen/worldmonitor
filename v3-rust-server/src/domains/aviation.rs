@@ -7,10 +7,13 @@ use std::{
 use axum::{Json, extract::State};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{AppState, error::AppError};
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
+const FLIGHT_RADAR_CACHE_TTL: Duration = Duration::from_secs(20);
+const OPENSKY_STATES_URL: &str = "https://opensky-network.org/api/states/all";
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +24,26 @@ pub struct ListAirportDelaysRequest {
     pub region: String,
     #[serde(default)]
     pub min_severity: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFlightRadarRequest {
+    #[serde(default)]
+    pub pagination: Option<PaginationRequest>,
+    #[serde(default)]
+    pub bounding_box: Option<BoundingBox>,
+    #[serde(default)]
+    pub include_ground: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundingBox {
+    #[serde(default)]
+    pub north_east: Option<GeoCoordinates>,
+    #[serde(default)]
+    pub south_west: Option<GeoCoordinates>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -38,6 +61,34 @@ pub struct ListAirportDelaysResponse {
     pub alerts: Vec<AirportDelayAlert>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pagination: Option<PaginationResponse>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFlightRadarResponse {
+    pub snapshot_at: i64,
+    pub source: String,
+    pub flights: Vec<FlightRadarTrack>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<PaginationResponse>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FlightRadarTrack {
+    pub id: String,
+    pub callsign: String,
+    pub icao24: String,
+    pub origin_country: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<GeoCoordinates>,
+    pub altitude_m: f64,
+    pub speed_mps: f64,
+    pub heading_deg: f64,
+    pub vertical_rate_mps: f64,
+    pub on_ground: bool,
+    pub squawk: String,
+    pub observed_at: i64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -63,7 +114,7 @@ pub struct AirportDelayAlert {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GeoCoordinates {
     pub latitude: f64,
@@ -83,7 +134,15 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
+#[derive(Clone)]
+struct FlightRadarCacheEntry {
+    value: GetFlightRadarResponse,
+    expires_at: Instant,
+}
+
 static AVIATION_CACHE: Lazy<Mutex<HashMap<String, CacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static FLIGHT_RADAR_CACHE: Lazy<Mutex<HashMap<String, FlightRadarCacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Copy)]
@@ -354,6 +413,67 @@ fn page_size(request: &ListAirportDelaysRequest) -> usize {
         .min(1_000)
 }
 
+fn flight_radar_page_size(request: &GetFlightRadarRequest) -> usize {
+    request
+        .pagination
+        .as_ref()
+        .map(|pagination| pagination.page_size)
+        .filter(|size| *size > 0)
+        .unwrap_or(250)
+        .min(1_000)
+}
+
+fn parse_f64_value(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number as f64);
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(number as f64);
+    }
+    value.as_str()?.trim().parse::<f64>().ok()
+}
+
+fn parse_i64_value(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(number as i64);
+    }
+    value.as_str()?.trim().parse::<i64>().ok()
+}
+
+fn parse_bool_value(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if let Some(boolean) = value.as_bool() {
+        return boolean;
+    }
+    if let Some(number) = value.as_i64() {
+        return number != 0;
+    }
+    value
+        .as_str()
+        .map(|text| {
+            let normalized = text.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        })
+        .unwrap_or(false)
+}
+
+fn parse_string_value(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_str)
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
 fn should_include_region(requested_region: &str, airport_region: &str) -> bool {
     let requested = requested_region.trim();
     requested.is_empty()
@@ -442,6 +562,160 @@ fn set_cache(key: String, value: &ListAirportDelaysResponse) -> Result<(), AppEr
     Ok(())
 }
 
+fn get_flight_radar_cache(key: &str) -> Result<Option<GetFlightRadarResponse>, AppError> {
+    let cache = FLIGHT_RADAR_CACHE
+        .lock()
+        .map_err(|_| AppError::Internal("flight radar cache lock poisoned".to_string()))?;
+    if let Some(entry) = cache.get(key)
+        && Instant::now() <= entry.expires_at
+    {
+        return Ok(Some(entry.value.clone()));
+    }
+    Ok(None)
+}
+
+fn set_flight_radar_cache(key: String, value: &GetFlightRadarResponse) -> Result<(), AppError> {
+    let mut cache = FLIGHT_RADAR_CACHE
+        .lock()
+        .map_err(|_| AppError::Internal("flight radar cache lock poisoned".to_string()))?;
+    cache.insert(
+        key,
+        FlightRadarCacheEntry {
+            value: value.clone(),
+            expires_at: Instant::now() + FLIGHT_RADAR_CACHE_TTL,
+        },
+    );
+    Ok(())
+}
+
+fn format_bbox_cache_key(bounding_box: Option<&BoundingBox>) -> String {
+    let Some(bounding_box) = bounding_box else {
+        return "global".to_string();
+    };
+    let (Some(south_west), Some(north_east)) = (&bounding_box.south_west, &bounding_box.north_east)
+    else {
+        return "global".to_string();
+    };
+    format!(
+        "{:.3},{:.3}:{:.3},{:.3}",
+        south_west.latitude, south_west.longitude, north_east.latitude, north_east.longitude
+    )
+}
+
+async fn fetch_opensky_tracks(
+    state: &AppState,
+    request: &GetFlightRadarRequest,
+) -> Vec<FlightRadarTrack> {
+    let mut url = match reqwest::Url::parse(OPENSKY_STATES_URL) {
+        Ok(url) => url,
+        Err(_) => return Vec::new(),
+    };
+
+    if let Some(bounding_box) = request.bounding_box.as_ref()
+        && let (Some(south_west), Some(north_east)) =
+            (&bounding_box.south_west, &bounding_box.north_east)
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("lamin", &south_west.latitude.to_string());
+        query.append_pair("lamax", &north_east.latitude.to_string());
+        query.append_pair("lomin", &south_west.longitude.to_string());
+        query.append_pair("lomax", &north_east.longitude.to_string());
+    }
+
+    let response = match state
+        .http_client
+        .get(url)
+        .header("Accept", "application/json")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => return Vec::new(),
+    };
+
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(_) => return Vec::new(),
+    };
+    let Some(states) = payload.get("states").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let now_ms = now_epoch_ms();
+    let mut tracks = states
+        .iter()
+        .filter_map(|row| {
+            let values = row.as_array()?;
+
+            let icao24 = parse_string_value(values.first());
+            if icao24.is_empty() {
+                return None;
+            }
+
+            let lon = parse_f64_value(values.get(5))?;
+            let lat = parse_f64_value(values.get(6))?;
+            if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+                return None;
+            }
+
+            let on_ground = parse_bool_value(values.get(8));
+            if on_ground && !request.include_ground {
+                return None;
+            }
+
+            let observed_at = parse_i64_value(values.get(4))
+                .map(|seconds| seconds.saturating_mul(1_000))
+                .unwrap_or(now_ms);
+            let callsign = {
+                let parsed = parse_string_value(values.get(1));
+                if parsed.is_empty() {
+                    format!(
+                        "UNK-{}",
+                        icao24
+                            .chars()
+                            .take(6)
+                            .collect::<String>()
+                            .to_ascii_uppercase()
+                    )
+                } else {
+                    parsed
+                }
+            };
+
+            Some(FlightRadarTrack {
+                id: format!("opensky-{}", icao24.to_ascii_lowercase()),
+                callsign,
+                icao24: icao24.to_ascii_uppercase(),
+                origin_country: parse_string_value(values.get(2)),
+                location: Some(GeoCoordinates {
+                    latitude: lat,
+                    longitude: lon,
+                }),
+                altitude_m: parse_f64_value(values.get(13))
+                    .or_else(|| parse_f64_value(values.get(7)))
+                    .unwrap_or(0.0),
+                speed_mps: parse_f64_value(values.get(9)).unwrap_or(0.0),
+                heading_deg: parse_f64_value(values.get(10)).unwrap_or(0.0),
+                vertical_rate_mps: parse_f64_value(values.get(11)).unwrap_or(0.0),
+                on_ground,
+                squawk: parse_string_value(values.get(14)),
+                observed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    tracks.sort_by(|a, b| {
+        b.speed_mps
+            .total_cmp(&a.speed_mps)
+            .then_with(|| b.observed_at.cmp(&a.observed_at))
+    });
+    tracks
+}
+
 pub async fn list_airport_delays(
     State(_state): State<AppState>,
     Json(request): Json<ListAirportDelaysRequest>,
@@ -483,5 +757,42 @@ pub async fn list_airport_delays(
     };
 
     set_cache(cache_key, &response)?;
+    Ok(Json(response))
+}
+
+pub async fn get_flight_radar(
+    State(state): State<AppState>,
+    Json(request): Json<GetFlightRadarRequest>,
+) -> Result<Json<GetFlightRadarResponse>, AppError> {
+    let size = flight_radar_page_size(&request);
+    let cache_key = format!(
+        "{}:{}:{}",
+        size,
+        request.include_ground,
+        format_bbox_cache_key(request.bounding_box.as_ref())
+    );
+    if let Some(cached) = get_flight_radar_cache(&cache_key)? {
+        return Ok(Json(cached));
+    }
+
+    let mut flights = fetch_opensky_tracks(&state, &request).await;
+    let total_count = flights.len();
+    flights.truncate(size);
+
+    let response = GetFlightRadarResponse {
+        snapshot_at: now_epoch_ms(),
+        source: if flights.is_empty() {
+            "FLIGHT_RADAR_SOURCE_OPENSKY_UNAVAILABLE".to_string()
+        } else {
+            "FLIGHT_RADAR_SOURCE_OPENSKY".to_string()
+        },
+        flights,
+        pagination: Some(PaginationResponse {
+            next_cursor: String::new(),
+            total_count,
+        }),
+    };
+
+    set_flight_radar_cache(cache_key, &response)?;
     Ok(Json(response))
 }

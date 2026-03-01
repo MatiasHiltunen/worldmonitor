@@ -486,9 +486,9 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{}"#))
                     .expect("build request"),
-        )
-        .await
-        .expect("route response");
+            )
+            .await
+            .expect("route response");
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert!(payload.is_object());

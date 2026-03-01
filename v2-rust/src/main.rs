@@ -492,6 +492,7 @@ enum MapEventKind {
 struct MapEventMarker {
     id: String,
     kind: MapEventKind,
+    country_code: String,
     title: String,
     subtitle: String,
     lat: f64,
@@ -506,6 +507,7 @@ impl Default for MapEventMarker {
         Self {
             id: String::new(),
             kind: MapEventKind::Earthquake,
+            country_code: String::new(),
             title: String::new(),
             subtitle: String::new(),
             lat: 0.0,
@@ -553,6 +555,63 @@ impl Default for GlobeCamera {
             pitch_deg: -12.0,
             zoom: 1.35,
             auto_rotate: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapTimeRange {
+    OneHour,
+    SixHours,
+    OneDay,
+    TwoDays,
+    SevenDays,
+    All,
+}
+
+impl MapTimeRange {
+    fn next(self) -> Self {
+        match self {
+            MapTimeRange::OneHour => MapTimeRange::SixHours,
+            MapTimeRange::SixHours => MapTimeRange::OneDay,
+            MapTimeRange::OneDay => MapTimeRange::TwoDays,
+            MapTimeRange::TwoDays => MapTimeRange::SevenDays,
+            MapTimeRange::SevenDays => MapTimeRange::All,
+            MapTimeRange::All => MapTimeRange::OneHour,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            MapTimeRange::OneHour => MapTimeRange::All,
+            MapTimeRange::SixHours => MapTimeRange::OneHour,
+            MapTimeRange::OneDay => MapTimeRange::SixHours,
+            MapTimeRange::TwoDays => MapTimeRange::OneDay,
+            MapTimeRange::SevenDays => MapTimeRange::TwoDays,
+            MapTimeRange::All => MapTimeRange::SevenDays,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            MapTimeRange::OneHour => "1h",
+            MapTimeRange::SixHours => "6h",
+            MapTimeRange::OneDay => "24h",
+            MapTimeRange::TwoDays => "48h",
+            MapTimeRange::SevenDays => "7d",
+            MapTimeRange::All => "all",
+        }
+    }
+
+    fn max_age_ms(self) -> Option<i64> {
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        match self {
+            MapTimeRange::OneHour => Some(HOUR_MS),
+            MapTimeRange::SixHours => Some(6 * HOUR_MS),
+            MapTimeRange::OneDay => Some(24 * HOUR_MS),
+            MapTimeRange::TwoDays => Some(48 * HOUR_MS),
+            MapTimeRange::SevenDays => Some(7 * 24 * HOUR_MS),
+            MapTimeRange::All => None,
         }
     }
 }
@@ -1269,6 +1328,7 @@ struct App {
     map_last_fetch_finished_at: Option<Instant>,
     map_last_fetch_summary: String,
     map_camera: GlobeCamera,
+    map_time_range: MapTimeRange,
     map_layers: MapLayerState,
     map_countries: Vec<MapCountryBoundary>,
     map_selected_event: usize,
@@ -1384,6 +1444,7 @@ impl App {
             map_last_fetch_finished_at: None,
             map_last_fetch_summary: "Map data not fetched yet".to_string(),
             map_camera: GlobeCamera::default(),
+            map_time_range: MapTimeRange::TwoDays,
             map_layers: MapLayerState::default(),
             map_countries,
             map_selected_event: 0,
@@ -1904,42 +1965,129 @@ impl App {
 
     fn map_toggle_layer_countries(&mut self) {
         self.map_layers.countries = !self.map_layers.countries;
+        self.status_line = if self.map_layers.countries {
+            "Map layer enabled: countries".to_string()
+        } else {
+            "Map layer disabled: countries".to_string()
+        };
     }
 
     fn map_toggle_layer_graticule(&mut self) {
         self.map_layers.graticule = !self.map_layers.graticule;
+        self.status_line = if self.map_layers.graticule {
+            "Map layer enabled: graticule".to_string()
+        } else {
+            "Map layer disabled: graticule".to_string()
+        };
     }
 
     fn map_toggle_layer_earthquakes(&mut self) {
         self.map_layers.earthquakes = !self.map_layers.earthquakes;
+        self.map_ensure_selected_event_visible();
+        self.status_line = if self.map_layers.earthquakes {
+            "Map layer enabled: earthquakes".to_string()
+        } else {
+            "Map layer disabled: earthquakes".to_string()
+        };
     }
 
     fn map_toggle_layer_unrest(&mut self) {
         self.map_layers.unrest = !self.map_layers.unrest;
+        self.map_ensure_selected_event_visible();
+        self.status_line = if self.map_layers.unrest {
+            "Map layer enabled: unrest".to_string()
+        } else {
+            "Map layer disabled: unrest".to_string()
+        };
     }
 
     fn map_toggle_layer_tier1(&mut self) {
         self.map_layers.tier1 = !self.map_layers.tier1;
+        self.status_line = if self.map_layers.tier1 {
+            "Map overlay enabled: tier-1 highlights".to_string()
+        } else {
+            "Map overlay disabled: tier-1 highlights".to_string()
+        };
+    }
+
+    fn map_cycle_time_range_next(&mut self) {
+        self.map_time_range = self.map_time_range.next();
+        self.map_ensure_selected_event_visible();
+        self.status_line = format!("Map time range set to {}", self.map_time_range.label());
+    }
+
+    fn map_cycle_time_range_prev(&mut self) {
+        self.map_time_range = self.map_time_range.prev();
+        self.map_ensure_selected_event_visible();
+        self.status_line = format!("Map time range set to {}", self.map_time_range.label());
+    }
+
+    fn map_event_visible(&self, marker: &MapEventMarker) -> bool {
+        map_marker_visible(marker, &self.map_layers)
+            && map_marker_in_time_range(marker, self.map_time_range)
+    }
+
+    fn map_visible_event_indices(&self) -> Vec<usize> {
+        self.map_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, marker)| {
+                if self.map_event_visible(marker) {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn map_ensure_selected_event_visible(&mut self) {
+        let visible = self.map_visible_event_indices();
+        if visible.is_empty() {
+            self.map_selected_event = 0;
+            return;
+        }
+        if !visible.contains(&self.map_selected_event) {
+            self.map_selected_event = visible[0];
+        }
     }
 
     fn map_select_next_event(&mut self) {
-        if self.map_events.is_empty() {
+        let visible = self.map_visible_event_indices();
+        if visible.is_empty() {
             self.map_selected_event = 0;
             return;
         }
-        self.map_selected_event = (self.map_selected_event + 1) % self.map_events.len();
+        let Some(position) = visible
+            .iter()
+            .position(|index| *index == self.map_selected_event)
+        else {
+            self.map_selected_event = visible[0];
+            return;
+        };
+        let next = (position + 1) % visible.len();
+        self.map_selected_event = visible[next];
     }
 
     fn map_select_prev_event(&mut self) {
-        if self.map_events.is_empty() {
+        let visible = self.map_visible_event_indices();
+        if visible.is_empty() {
             self.map_selected_event = 0;
             return;
         }
-        if self.map_selected_event == 0 {
-            self.map_selected_event = self.map_events.len() - 1;
+        let Some(position) = visible
+            .iter()
+            .position(|index| *index == self.map_selected_event)
+        else {
+            self.map_selected_event = visible[0];
+            return;
+        };
+        let prev = if position == 0 {
+            visible.len() - 1
         } else {
-            self.map_selected_event -= 1;
-        }
+            position - 1
+        };
+        self.map_selected_event = visible[prev];
     }
 
     fn map_focus_selected_event(&mut self) {
@@ -1952,6 +2100,13 @@ impl App {
             "Map focused on {}",
             truncate_for_error(event.title.as_str(), 70)
         );
+    }
+
+    fn map_selected_event_country_code(&self) -> Option<String> {
+        self.map_events
+            .get(self.map_selected_event)
+            .map(|event| event.country_code.trim().to_uppercase())
+            .filter(|code| is_valid_country_code(code))
     }
 
     fn map_focus_country(&mut self, country_code: &str) -> bool {
@@ -2861,6 +3016,7 @@ fn build_map_markers_from_earthquakes(payload: Value) -> Result<Vec<MapEventMark
                     quake.id
                 },
                 kind: MapEventKind::Earthquake,
+                country_code: String::new(),
                 title: quake.place,
                 subtitle: format!("M{:.1} | {:.1} km", quake.magnitude, quake.depth_km),
                 lat: location.latitude,
@@ -2903,6 +3059,7 @@ fn build_map_markers_from_unrest(
                     event.id
                 },
                 kind: MapEventKind::Unrest,
+                country_code: event.country.trim().to_uppercase(),
                 title: if event.title.trim().is_empty() {
                     format!(
                         "{} {}",
@@ -3112,6 +3269,16 @@ fn map_marker_visible(marker: &MapEventMarker, layers: &MapLayerState) -> bool {
         MapEventKind::Earthquake => layers.earthquakes,
         MapEventKind::Unrest => layers.unrest,
     }
+}
+
+fn map_marker_in_time_range(marker: &MapEventMarker, range: MapTimeRange) -> bool {
+    let Some(max_age_ms) = range.max_age_ms() else {
+        return true;
+    };
+    if marker.occurred_at <= 0 {
+        return false;
+    }
+    now_epoch_ms().saturating_sub(marker.occurred_at) <= max_age_ms
 }
 
 fn now_epoch_ms() -> i64 {
@@ -4194,11 +4361,7 @@ fn apply_worker_events(app: &mut App, receiver: &Receiver<WorkerEvent>) {
                         .then_with(|| right.magnitude.total_cmp(&left.magnitude))
                 });
                 app.map_events = events;
-                if app.map_events.is_empty() {
-                    app.map_selected_event = 0;
-                } else if app.map_selected_event >= app.map_events.len() {
-                    app.map_selected_event = 0;
-                }
+                app.map_ensure_selected_event_visible();
 
                 let warning_count = result.warnings.len();
                 app.map_last_fetch_summary = format!(
@@ -4441,7 +4604,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             "SETTINGS | ↑/↓ select check | u/d detail scroll | g rescan keys | a auto | Tab cycle | q quit"
         }
         AppView::Map => {
-            "MAP | ←/→ yaw | ↑/↓ pitch | +/- zoom | r refresh | n/p select | Enter focus | b brief country | c/g/e/u/t layers | o auto-rotate | Tab cycle | q quit"
+            "MAP | ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | r refresh | n/p select | Enter focus | y sync brief | b brief country | c/g/e/u/t layers | o auto-rotate | Tab cycle | q quit"
         }
     };
 
@@ -5162,15 +5325,15 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .constraints([Constraint::Min(12), Constraint::Length(9)])
         .split(horizontal[1]);
 
-    let earthquake_count = app
-        .map_events
+    let visible_event_indices = app.map_visible_event_indices();
+    let visible_event_count = visible_event_indices.len();
+    let visible_earthquake_count = visible_event_indices
         .iter()
-        .filter(|marker| marker.kind == MapEventKind::Earthquake)
+        .filter(|index| app.map_events[**index].kind == MapEventKind::Earthquake)
         .count();
-    let unrest_count = app
-        .map_events
+    let visible_unrest_count = visible_event_indices
         .iter()
-        .filter(|marker| marker.kind == MapEventKind::Unrest)
+        .filter(|index| app.map_events[**index].kind == MapEventKind::Unrest)
         .count();
     let focused_country = if app.map_countries.iter().any(|country| {
         country
@@ -5219,19 +5382,32 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
             map_layer_span("spin", app.map_camera.auto_rotate, Color::Green),
         ]),
         Line::from(vec![
+            Span::styled("Time range ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.map_time_range.label(),
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
             Span::styled("Events ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} total", app.map_events.len()),
+                format!(
+                    "{} visible / {} total",
+                    visible_event_count,
+                    app.map_events.len()
+                ),
                 Style::default().fg(Color::White),
             ),
             Span::styled("  EQ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                earthquake_count.to_string(),
+                visible_earthquake_count.to_string(),
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled("  Unrest ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                unrest_count.to_string(),
+                visible_unrest_count.to_string(),
                 Style::default().fg(Color::LightRed),
             ),
         ]),
@@ -5268,17 +5444,11 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .wrap(Wrap { trim: false });
     frame.render_widget(dashboard, left[0]);
 
-    let event_items: Vec<ListItem<'_>> = app
-        .map_events
+    let event_items: Vec<ListItem<'_>> = visible_event_indices
         .iter()
-        .enumerate()
-        .map(|(index, marker)| {
-            let enabled = map_marker_visible(marker, &app.map_layers);
-            let marker_color = if enabled {
-                map_marker_color(marker)
-            } else {
-                Color::DarkGray
-            };
+        .map(|index| {
+            let marker = &app.map_events[*index];
+            let marker_color = map_marker_color(marker);
             let age = format_age(marker.occurred_at);
             let label = format!(
                 "{} | {} | {}",
@@ -5287,21 +5457,18 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
                 truncate_for_error(marker.title.as_str(), 34)
             );
             let mut style = Style::default().fg(marker_color);
-            if !enabled {
-                style = style.add_modifier(Modifier::DIM);
-            }
-            if index == app.map_selected_event {
+            if *index == app.map_selected_event {
                 style = style.add_modifier(Modifier::BOLD);
             }
             ListItem::new(Line::from(vec![Span::styled(label, style)]))
         })
         .collect();
     let event_list = List::new(event_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Signal Queue ({})", app.map_events.len())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Signal Queue ({}/{})",
+            visible_event_count,
+            app.map_events.len()
+        )))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -5309,8 +5476,12 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         )
         .highlight_symbol(">> ");
     let mut event_state = ListState::default();
-    if !app.map_events.is_empty() {
-        event_state.select(Some(app.map_selected_event));
+    if !visible_event_indices.is_empty() {
+        let selected_position = visible_event_indices
+            .iter()
+            .position(|index| *index == app.map_selected_event)
+            .unwrap_or(0);
+        event_state.select(Some(selected_position));
     }
     frame.render_stateful_widget(event_list, left[1], &mut event_state);
 
@@ -5351,7 +5522,7 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
             }
 
             for (index, marker) in app.map_events.iter().enumerate() {
-                if !map_marker_visible(marker, &app.map_layers) {
+                if !app.map_event_visible(marker) {
                     continue;
                 }
                 let rotated = rotate_globe_point(marker.lon, marker.lat, &app.map_camera);
@@ -5389,10 +5560,16 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .map_events
         .get(app.map_selected_event)
         .map(|marker| {
+            let country_line = if marker.country_code.is_empty() {
+                "Country: n/a".to_string()
+            } else {
+                format!("Country: {}", marker.country_code)
+            };
             format!(
-                "Type: {}  Age: {}\nTitle: {}\nContext: {}\nCoordinates: {:.3}, {:.3}\nID: {}\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | Enter focus | n/p cycle",
+                "Type: {}  Age: {}\n{}\nTitle: {}\nContext: {}\nCoordinates: {:.3}, {:.3}\nID: {}\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | Enter focus | n/p cycle | y sync brief",
                 marker_kind_label(marker.kind),
                 format_age(marker.occurred_at),
+                country_line,
                 marker.title,
                 marker.subtitle,
                 marker.lat,
@@ -5401,7 +5578,7 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
             )
         })
         .unwrap_or_else(|| {
-            "No map events yet. Press r/f to refresh globe overlays.\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | o auto-rotate".to_string()
+            "No map events for current filters. Press r/f to refresh globe overlays.\n\nControls: ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | o auto-rotate".to_string()
         });
     let detail_panel = Paragraph::new(detail_text)
         .block(
@@ -5777,6 +5954,8 @@ fn run_app(
                     KeyCode::Down => app.map_rotate_pitch(-3.0),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.map_zoom_in(),
                     KeyCode::Char('-') | KeyCode::Char('_') => app.map_zoom_out(),
+                    KeyCode::Char('[') => app.map_cycle_time_range_prev(),
+                    KeyCode::Char(']') => app.map_cycle_time_range_next(),
                     KeyCode::Char('o') => app.map_toggle_auto_rotate(),
                     KeyCode::Char('0') => app.map_reset_camera(),
                     KeyCode::Char('r') | KeyCode::Char('f') => {
@@ -5792,6 +5971,23 @@ fn run_app(
                                 "Country {} not found in local country boundaries",
                                 country_code
                             );
+                        }
+                    }
+                    KeyCode::Char('y') => {
+                        if let Some(country_code) = app.map_selected_event_country_code() {
+                            app.set_brief_country_code(country_code.clone());
+                            if app.map_focus_country(country_code.as_str()) {
+                                app.status_line = format!(
+                                    "Synced BRIEF country to {} and focused globe",
+                                    country_code
+                                );
+                            } else {
+                                app.status_line =
+                                    format!("Synced BRIEF country to {}", country_code);
+                            }
+                        } else {
+                            app.status_line =
+                                "Selected event has no valid country code to sync".to_string();
                         }
                     }
                     KeyCode::Char('c') => app.map_toggle_layer_countries(),

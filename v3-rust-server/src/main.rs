@@ -235,4 +235,46 @@ mod tests {
             .expect("route response");
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn gdelt_search_requires_query_length() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/intelligence/v1/search-gdelt-documents")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"query":"a"}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["query"], "a");
+        assert_eq!(
+            payload["error"],
+            "Query parameter required (min 2 characters)"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_event_without_groq_key_returns_empty_payload() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/intelligence/v1/classify-event")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"title":"Signal report"}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload.get("classification").is_none());
+    }
 }

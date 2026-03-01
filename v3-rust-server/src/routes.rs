@@ -50,6 +50,18 @@ pub fn build_router(state: AppState) -> Router {
             post(intelligence::get_country_intel_brief),
         )
         .route(
+            "/api/intelligence/v1/get-pizzint-status",
+            post(intelligence::get_pizzint_status),
+        )
+        .route(
+            "/api/intelligence/v1/classify-event",
+            post(intelligence::classify_event),
+        )
+        .route(
+            "/api/intelligence/v1/search-gdelt-documents",
+            post(intelligence::search_gdelt_documents),
+        )
+        .route(
             "/api/intelligence/v1/get-risk-scores",
             post(intelligence::get_risk_scores),
         )

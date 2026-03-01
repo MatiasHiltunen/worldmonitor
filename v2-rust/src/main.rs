@@ -616,6 +616,77 @@ impl MapTimeRange {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapRegionView {
+    Global,
+    America,
+    Mena,
+    Europe,
+    Asia,
+    LatAm,
+    Africa,
+    Oceania,
+    Custom,
+}
+
+impl MapRegionView {
+    fn label(self) -> &'static str {
+        match self {
+            MapRegionView::Global => "global",
+            MapRegionView::America => "america",
+            MapRegionView::Mena => "mena",
+            MapRegionView::Europe => "europe",
+            MapRegionView::Asia => "asia",
+            MapRegionView::LatAm => "latam",
+            MapRegionView::Africa => "africa",
+            MapRegionView::Oceania => "oceania",
+            MapRegionView::Custom => "custom",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            MapRegionView::Global => MapRegionView::America,
+            MapRegionView::America => MapRegionView::Mena,
+            MapRegionView::Mena => MapRegionView::Europe,
+            MapRegionView::Europe => MapRegionView::Asia,
+            MapRegionView::Asia => MapRegionView::LatAm,
+            MapRegionView::LatAm => MapRegionView::Africa,
+            MapRegionView::Africa => MapRegionView::Oceania,
+            MapRegionView::Oceania => MapRegionView::Global,
+            MapRegionView::Custom => MapRegionView::Global,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            MapRegionView::Global => MapRegionView::Oceania,
+            MapRegionView::America => MapRegionView::Global,
+            MapRegionView::Mena => MapRegionView::America,
+            MapRegionView::Europe => MapRegionView::Mena,
+            MapRegionView::Asia => MapRegionView::Europe,
+            MapRegionView::LatAm => MapRegionView::Asia,
+            MapRegionView::Africa => MapRegionView::LatAm,
+            MapRegionView::Oceania => MapRegionView::Africa,
+            MapRegionView::Custom => MapRegionView::Oceania,
+        }
+    }
+
+    fn camera(self) -> Option<(f64, f64, f64)> {
+        match self {
+            MapRegionView::Global => Some((0.0, -12.0, 1.35)),
+            MapRegionView::America => Some((95.0, -12.0, 1.85)),
+            MapRegionView::Mena => Some((-35.0, -20.0, 2.15)),
+            MapRegionView::Europe => Some((-10.0, -44.0, 2.2)),
+            MapRegionView::Asia => Some((-98.0, -26.0, 1.9)),
+            MapRegionView::LatAm => Some((64.0, 12.0, 2.0)),
+            MapRegionView::Africa => Some((-20.0, -5.0, 1.95)),
+            MapRegionView::Oceania => Some((-150.0, 25.0, 2.15)),
+            MapRegionView::Custom => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct MapFetchResult {
     earthquakes: Vec<MapEventMarker>,
@@ -1328,6 +1399,7 @@ struct App {
     map_last_fetch_finished_at: Option<Instant>,
     map_last_fetch_summary: String,
     map_camera: GlobeCamera,
+    map_region_view: MapRegionView,
     map_time_range: MapTimeRange,
     map_layers: MapLayerState,
     map_countries: Vec<MapCountryBoundary>,
@@ -1444,6 +1516,7 @@ impl App {
             map_last_fetch_finished_at: None,
             map_last_fetch_summary: "Map data not fetched yet".to_string(),
             map_camera: GlobeCamera::default(),
+            map_region_view: MapRegionView::Global,
             map_time_range: MapTimeRange::TwoDays,
             map_layers: MapLayerState::default(),
             map_countries,
@@ -1935,22 +2008,27 @@ impl App {
 
     fn map_rotate_yaw(&mut self, delta_deg: f64) {
         self.map_camera.yaw_deg = normalize_longitude_deg(self.map_camera.yaw_deg + delta_deg);
+        self.map_region_view = MapRegionView::Custom;
     }
 
     fn map_rotate_pitch(&mut self, delta_deg: f64) {
         self.map_camera.pitch_deg = (self.map_camera.pitch_deg + delta_deg).clamp(-80.0, 80.0);
+        self.map_region_view = MapRegionView::Custom;
     }
 
     fn map_zoom_in(&mut self) {
         self.map_camera.zoom = (self.map_camera.zoom + 0.12).clamp(0.7, 3.8);
+        self.map_region_view = MapRegionView::Custom;
     }
 
     fn map_zoom_out(&mut self) {
         self.map_camera.zoom = (self.map_camera.zoom - 0.12).clamp(0.7, 3.8);
+        self.map_region_view = MapRegionView::Custom;
     }
 
     fn map_reset_camera(&mut self) {
         self.map_camera = GlobeCamera::default();
+        self.map_region_view = MapRegionView::Global;
         self.status_line = "Map camera reset".to_string();
     }
 
@@ -2020,6 +2098,24 @@ impl App {
         self.map_time_range = self.map_time_range.prev();
         self.map_ensure_selected_event_visible();
         self.status_line = format!("Map time range set to {}", self.map_time_range.label());
+    }
+
+    fn map_apply_region_view(&mut self, view: MapRegionView) {
+        if let Some((yaw, pitch, zoom)) = view.camera() {
+            self.map_camera.yaw_deg = yaw;
+            self.map_camera.pitch_deg = pitch;
+            self.map_camera.zoom = zoom;
+            self.map_region_view = view;
+            self.status_line = format!("Map region preset: {}", view.label());
+        }
+    }
+
+    fn map_cycle_region_next(&mut self) {
+        self.map_apply_region_view(self.map_region_view.next());
+    }
+
+    fn map_cycle_region_prev(&mut self) {
+        self.map_apply_region_view(self.map_region_view.prev());
     }
 
     fn map_event_visible(&self, marker: &MapEventMarker) -> bool {
@@ -2096,6 +2192,7 @@ impl App {
         };
         self.map_camera.yaw_deg = normalize_longitude_deg(-event.lon);
         self.map_camera.pitch_deg = (-event.lat).clamp(-80.0, 80.0);
+        self.map_region_view = MapRegionView::Custom;
         self.status_line = format!(
             "Map focused on {}",
             truncate_for_error(event.title.as_str(), 70)
@@ -2117,6 +2214,7 @@ impl App {
         {
             self.map_camera.yaw_deg = normalize_longitude_deg(-country.centroid_lon);
             self.map_camera.pitch_deg = (-country.centroid_lat).clamp(-80.0, 80.0);
+            self.map_region_view = MapRegionView::Custom;
             self.status_line = format!("Map focused on {} ({})", country.name, country.code);
             return true;
         }
@@ -4604,7 +4702,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             "SETTINGS | ↑/↓ select check | u/d detail scroll | g rescan keys | a auto | Tab cycle | q quit"
         }
         AppView::Map => {
-            "MAP | ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | r refresh | n/p select | Enter focus | y sync brief | b brief country | c/g/e/u/t layers | o auto-rotate | Tab cycle | q quit"
+            "MAP | ←/→ yaw | ↑/↓ pitch | +/- zoom | [/] time | v/V region | r refresh | n/p select | Enter focus | y sync brief | b brief country | c/g/e/u/t layers | o auto-rotate | Tab cycle | q quit"
         }
     };
 
@@ -5318,7 +5416,7 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
         .split(area);
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(8)])
+        .constraints([Constraint::Length(12), Constraint::Min(8)])
         .split(horizontal[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -5362,6 +5460,19 @@ fn draw_map_workspace(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rec
                     app.map_camera.yaw_deg, app.map_camera.pitch_deg, app.map_camera.zoom
                 ),
                 Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("View ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.map_region_view.label(),
+                Style::default()
+                    .fg(if app.map_region_view == MapRegionView::Custom {
+                        Color::Yellow
+                    } else {
+                        Color::LightBlue
+                    })
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -5956,6 +6067,8 @@ fn run_app(
                     KeyCode::Char('-') | KeyCode::Char('_') => app.map_zoom_out(),
                     KeyCode::Char('[') => app.map_cycle_time_range_prev(),
                     KeyCode::Char(']') => app.map_cycle_time_range_next(),
+                    KeyCode::Char('v') => app.map_cycle_region_next(),
+                    KeyCode::Char('V') => app.map_cycle_region_prev(),
                     KeyCode::Char('o') => app.map_toggle_auto_rotate(),
                     KeyCode::Char('0') => app.map_reset_camera(),
                     KeyCode::Char('r') | KeyCode::Char('f') => {
